@@ -1,6 +1,8 @@
 #pragma once
 
 #include <stack>
+#include <set>
+#include <vector>
 #include "Jitter_CodeGen.h"
 #include "MemStream.h"
 
@@ -41,6 +43,16 @@ namespace Jitter
 		bool SupportsCmpSelect() const override;
 		uint32 GetPointerSize() const override;
 
+		//Context promotion: relative (context) symbols that are only accessed as one whole
+		//symbol are kept in wasm locals for the whole function (loaded at entry, stored back
+		//at exit and around calls). Context arrays reached through references must be
+		//registered so that symbols inside them are left in memory; a function that takes
+		//a reference to an unregistered part of the context is not promoted.
+		void SetContextPromotion(bool);
+		static void RegisterContextArray(uint32 offset, uint32 size);
+		//Name for the next generated function (profiling); empty: no name section
+		void SetFunctionName(std::string);
+
 	private:
 		enum LABEL_FLOW
 		{
@@ -77,6 +89,16 @@ namespace Jitter
 		void PrepareLocalVars(const StatementList&);
 
 		uint32 GetTemporaryLocation(CSymbol*) const;
+
+		typedef std::pair<SYM_TYPE, uint32> PromotedKey;
+		void PreparePromotion(const StatementList&);
+		bool IsPromoted(const CSymbol*) const;
+		uint32 GetPromotedLocal(const CSymbol*) const;
+		uint32 GetPromotedLocal(const PromotedKey&) const;
+		void EmitPromotedLoad(const PromotedKey&);
+		void EmitPromotedStore(const PromotedKey&);
+		void EmitPromotedLoadAll();
+		void EmitPromotedStoreDirty();
 
 		void PushContext();
 
@@ -247,5 +269,11 @@ namespace Jitter
 		uint32 m_currentBlockDepth = 0;
 		uint32 m_loopBlock = -1;
 		ParamStack m_params;
+
+		bool m_contextPromotion = false;
+		std::string m_functionName;
+		std::map<PromotedKey, uint32> m_promotedLocations;
+		std::set<PromotedKey> m_promotedDirty;
+		static std::vector<std::pair<uint32, uint32>> m_contextArrays;
 	};
 }

@@ -3,6 +3,7 @@
 #include "Stream.h"
 #include "Types.h"
 #include <vector>
+#include <string>
 
 class CWasmModuleBuilder
 {
@@ -21,6 +22,7 @@ public:
 		uint32 localI64Count = 0;
 		uint32 localF32Count = 0;
 		uint32 localV128Count = 0;
+		std::string name; //Written to a "name" custom section when not empty (profiling)
 	};
 
 	static void WriteSLeb128(Framework::CStream&, int64);

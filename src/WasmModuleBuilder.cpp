@@ -179,7 +179,11 @@ void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
 		if(function.localI64Count != 0) localDeclCount++;
 		if(function.localF32Count != 0) localDeclCount++;
 		if(function.localV128Count != 0) localDeclCount++;
-		uint32 localDeclSize = (localDeclCount * 2) + 1;
+		uint32 localDeclSize = 1;
+		for(uint32 count : {function.localI32Count, function.localI64Count, function.localF32Count, function.localV128Count})
+		{
+			if(count != 0) localDeclSize += GetULeb128Size(count) + 1;
+		}
 		uint32 functionBodySize = function.code.size() + localDeclSize;
 
 		uint32 sectionSize =
@@ -216,6 +220,23 @@ void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
 		}
 
 		stream.Write(function.code.data(), function.code.size());
+	}
+
+	//Custom section "name" (function names subsection), lets profilers tell blocks apart
+	if(!m_functions[0].name.empty())
+	{
+		const auto& name = m_functions[0].name;
+		uint32 nameSize = static_cast<uint32>(name.size());
+		uint32 subsectionSize = 1 + 1 + GetULeb128Size(nameSize) + nameSize; //count, index, name
+		uint32 sectionSize = 1 + 4 + 1 + GetULeb128Size(subsectionSize) + subsectionSize;
+		WriteSectionHeader(stream, 0, sectionSize);
+		WriteName(stream, "name");
+		stream.Write8(1); //Function names
+		WriteULeb128(stream, subsectionSize);
+		stream.Write8(1); //Count
+		stream.Write8(0); //Function index
+		WriteULeb128(stream, nameSize);
+		stream.Write(name.data(), nameSize);
 	}
 }
 

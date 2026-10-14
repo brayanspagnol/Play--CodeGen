@@ -41,6 +41,12 @@ void CCodeGen_Wasm::Emit_Shift64_MemAnyAny(const STATEMENT& statement)
 
 void CCodeGen_Wasm::PushRelative64(CSymbol* symbol)
 {
+	if(IsPromoted(symbol))
+	{
+		m_functionStream.Write8(Wasm::INST_LOCAL_GET);
+		CWasmModuleBuilder::WriteULeb128(m_functionStream, GetPromotedLocal(symbol));
+		return;
+	}
 	PushRelativeAddress(symbol);
 
 	m_functionStream.Write8(Wasm::INST_I64_LOAD);
