@@ -170,12 +170,15 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
 
 #include <emscripten.h>
 // clang-format off
-EM_JS_DEPS(WasmRegisterExternFunction, "$convertJsFunctionToWasm");
-EM_JS(int, RegisterExternFunction, (const char* functionName, const char* functionSig), {
+EM_JS_DEPS(WasmRegisterExternFunction, "$convertJsFunctionToWasm,$getWasmTableEntry");
+EM_JS(int, RegisterExternFunction, (const char* functionName, const char* functionSig, uintptr_t functionPtr), {
 	let fctName = UTF8ToString(functionName);
 	let fctSig = UTF8ToString(functionSig);
+	//The function's own table entry is a wasm function: generated code calls it without going
+	//through JavaScript (the export below is a JS wrapper around the same function)
+	let tableFct = getWasmTableEntry(functionPtr);
 	let fct = Module[fctName];
-	if(fct === undefined)
+	if(fct === undefined && !tableFct)
 	{
 		out(`Warning: Could not find function '${fctName}' (missing export?).`);
 	}
@@ -189,7 +192,7 @@ EM_JS(int, RegisterExternFunction, (const char* functionName, const char* functi
 	}
 	//TODO: Check how we can use the export from the WASM module directly
 	//instead of having to wrap the wrapper
-	let wrappedFct = convertJsFunctionToWasm(fct, fctSig);
+	let wrappedFct = tableFct ? tableFct : convertJsFunctionToWasm(fct, fctSig);
 	let fctId = Module.codeGenImportTableNextIndex++;
 	Module.codeGenImportTable.set(fctId, wrappedFct);
 	out(`Registered function '${fctName}(${fctSig})' = > id = ${fctId}.`);
@@ -206,7 +209,7 @@ void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char* 
 		assert(fctIterator == m_functions.end());
 	}
 	WASM_FUNCTION_INFO functionInfo;
-	functionInfo.id = RegisterExternFunction(functionName, functionSig);
+	functionInfo.id = RegisterExternFunction(functionName, functionSig, functionPtr);
 	functionInfo.signature = functionSig;
 	m_functions.insert(std::make_pair(functionPtr, functionInfo));
 }
