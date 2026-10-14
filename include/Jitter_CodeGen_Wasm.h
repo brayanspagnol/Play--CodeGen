@@ -91,10 +91,28 @@ namespace Jitter
 		uint32 GetTemporaryLocation(CSymbol*) const;
 
 		typedef std::pair<SYM_TYPE, uint32> PromotedKey;
+		enum PROMOTED_KIND
+		{
+			PROMOTED_WHOLE,     //Access is the whole container local
+			PROMOTED_LANE,      //Access is a lane of a v128 container
+			PROMOTED_BITCAST,   //f32 access to an i32 container
+		};
+		struct PROMOTED_ACCESS
+		{
+			PromotedKey container;
+			PROMOTED_KIND kind = PROMOTED_WHOLE;
+			uint32 lane = 0;
+		};
 		void PreparePromotion(const StatementList&);
 		bool IsPromoted(const CSymbol*) const;
-		uint32 GetPromotedLocal(const CSymbol*) const;
+		const PROMOTED_ACCESS& GetPromotedAccess(const CSymbol*) const;
 		uint32 GetPromotedLocal(const PromotedKey&) const;
+		void PushPromoted(const CSymbol*);
+		void CommitPromoted(const CSymbol*);
+		void PushPromotedBits(const CSymbol*);
+		void CommitPromotedBits(const CSymbol*);
+		void EmitLocalGet(uint32);
+		void EmitLocalSet(uint32);
 		void EmitPromotedLoad(const PromotedKey&);
 		void EmitPromotedStore(const PromotedKey&);
 		void EmitPromotedLoadAll();
@@ -272,8 +290,12 @@ namespace Jitter
 
 		bool m_contextPromotion = false;
 		std::string m_functionName;
-		std::map<PromotedKey, uint32> m_promotedLocations;
+		std::map<PromotedKey, uint32> m_promotedLocations; //Container -> group-relative local index
+		std::map<PromotedKey, PROMOTED_ACCESS> m_promotedAccesses;
 		std::set<PromotedKey> m_promotedDirty;
+		uint32 m_scratchI32Local = 0;
+		uint32 m_scratchI64Local = 0;
+		uint32 m_scratchF32Local = 0;
 		static std::vector<std::pair<uint32, uint32>> m_contextArrays;
 	};
 }

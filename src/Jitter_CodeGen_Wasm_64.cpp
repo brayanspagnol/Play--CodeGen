@@ -43,8 +43,7 @@ void CCodeGen_Wasm::PushRelative64(CSymbol* symbol)
 {
 	if(IsPromoted(symbol))
 	{
-		m_functionStream.Write8(Wasm::INST_LOCAL_GET);
-		CWasmModuleBuilder::WriteULeb128(m_functionStream, GetPromotedLocal(symbol));
+		PushPromoted(symbol);
 		return;
 	}
 	PushRelativeAddress(symbol);

@@ -274,6 +274,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	m_currentBlockDepth = 0;
 	m_loopBlock = -1;
 	m_promotedLocations.clear();
+	m_promotedAccesses.clear();
 	m_promotedDirty.clear();
 
 	BuildLabelFlows(statements);
@@ -702,8 +703,7 @@ void CCodeGen_Wasm::PushRelative(CSymbol* symbol)
 {
 	if(IsPromoted(symbol))
 	{
-		m_functionStream.Write8(Wasm::INST_LOCAL_GET);
-		CWasmModuleBuilder::WriteULeb128(m_functionStream, GetPromotedLocal(symbol));
+		PushPromoted(symbol);
 		return;
 	}
 	PushRelativeAddress(symbol);
@@ -847,8 +847,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
 {
 	if(IsPromoted(symbol))
 	{
-		m_functionStream.Write8(Wasm::INST_LOCAL_SET);
-		CWasmModuleBuilder::WriteULeb128(m_functionStream, GetPromotedLocal(symbol));
+		CommitPromoted(symbol);
 		return;
 	}
 	switch(symbol->m_type)
@@ -1485,32 +1484,100 @@ void CCodeGen_Wasm::PreparePromotion(const StatementList& statements)
 		    });
 	}
 
+	//Containers: every 128-bit symbol, and scalar symbols that are not inside a 128-bit one.
+	//Smaller accesses inside a container become lanes (or a bitcast for f32 over i32).
+	auto isInside128 = [&](const ACCESS& access) {
+		for(const auto& other : accesses)
+		{
+			if(other.first.first != SYM_RELATIVE128) continue;
+			if((access.start < other.second.end) && (other.second.start < access.end)) return true;
+		}
+		return false;
+	};
+	std::map<PromotedKey, ACCESS> containers;
 	for(const auto& accessPair : accesses)
 	{
 		const auto& key = accessPair.first;
-		const auto& access = accessPair.second;
-		if(excluded.count(key)) continue;
-		bool aliased = false;
-		for(const auto& otherPair : accesses)
-		{
-			if(otherPair.first == key) continue;
-			if((access.start < otherPair.second.end) && (otherPair.second.start < access.end))
-			{
-				aliased = true;
-				break;
-			}
-		}
-		for(const auto& range : usedArrays)
-		{
-			if((access.start < range.first + range.second) && (range.first < access.end))
-			{
-				aliased = true;
-				break;
-			}
-		}
-		if(aliased) continue;
-		uint32 groupIndex = 0;
 		switch(key.first)
+		{
+		case SYM_RELATIVE128:
+			containers[key] = accessPair.second;
+			break;
+		case SYM_RELATIVE:
+		case SYM_RELATIVE64:
+			if(!isInside128(accessPair.second)) containers[key] = accessPair.second;
+			break;
+		case SYM_FP_RELATIVE32:
+			//f32 container only when no i32 symbol is at the same place (else it maps to it)
+			if(!isInside128(accessPair.second) && !accesses.count(PromotedKey(SYM_RELATIVE, key.second)))
+			{
+				containers[key] = accessPair.second;
+			}
+			break;
+		default:
+			break;
+		}
+	}
+
+	for(const auto& containerPair : containers)
+	{
+		const auto& containerKey = containerPair.first;
+		const auto& range = containerPair.second;
+		if(excluded.count(containerKey)) continue;
+		bool promotable = true;
+		std::map<PromotedKey, PROMOTED_ACCESS> members;
+		for(const auto& accessPair : accesses)
+		{
+			const auto& key = accessPair.first;
+			const auto& access = accessPair.second;
+			if(!((access.start < range.end) && (range.start < access.end))) continue;
+			if(excluded.count(key) || (access.start < range.start) || (access.end > range.end))
+			{
+				promotable = false;
+				break;
+			}
+			PROMOTED_ACCESS member;
+			member.container = containerKey;
+			if(key == containerKey)
+			{
+				member.kind = PROMOTED_WHOLE;
+			}
+			else if(containerKey.first == SYM_RELATIVE128)
+			{
+				uint32 size = access.end - access.start;
+				uint32 offset = access.start - range.start;
+				if((key.first == SYM_REL_REFERENCE) || ((offset % size) != 0))
+				{
+					promotable = false;
+					break;
+				}
+				member.kind = PROMOTED_LANE;
+				member.lane = offset / size;
+			}
+			else if((containerKey.first == SYM_RELATIVE) && (key.first == SYM_FP_RELATIVE32) && (access.start == range.start))
+			{
+				member.kind = PROMOTED_BITCAST;
+			}
+			else
+			{
+				promotable = false;
+				break;
+			}
+			members[key] = member;
+		}
+		if(!promotable) continue;
+		for(const auto& arrayRange : usedArrays)
+		{
+			if((range.start < arrayRange.first + arrayRange.second) && (arrayRange.first < range.end))
+			{
+				promotable = false;
+				break;
+			}
+		}
+		if(!promotable) continue;
+
+		uint32 groupIndex = 0;
+		switch(containerKey.first)
 		{
 		case SYM_RELATIVE:
 			groupIndex = m_localI32Count++;
@@ -1525,22 +1592,40 @@ void CCodeGen_Wasm::PreparePromotion(const StatementList& statements)
 			groupIndex = m_localV128Count++;
 			break;
 		default:
-			continue;
+			assert(false);
+			break;
 		}
-		m_promotedLocations[key] = groupIndex;
-		if(written.count(key)) m_promotedDirty.insert(key);
+		m_promotedLocations[containerKey] = groupIndex;
+		for(const auto& member : members)
+		{
+			m_promotedAccesses[member.first] = member.second;
+			if(written.count(member.first)) m_promotedDirty.insert(containerKey);
+		}
+	}
+
+	if(!m_promotedLocations.empty())
+	{
+		//Scratch locals for lane writes (group-relative for now, made absolute below)
+		m_scratchI32Local = m_localI32Count++;
+		m_scratchI64Local = m_localI64Count++;
+		m_scratchF32Local = m_localF32Count++;
+		m_scratchI32Local = m_scratchI32Local + 1;
+		m_scratchI64Local = m_scratchI64Local + m_localI32Count + 1;
+		m_scratchF32Local = m_scratchF32Local + m_localI32Count + m_localI64Count + 1;
 	}
 }
 
 bool CCodeGen_Wasm::IsPromoted(const CSymbol* symbol) const
 {
-	if(m_promotedLocations.empty()) return false;
-	return m_promotedLocations.count(PromotedKey(symbol->m_type, symbol->m_valueLow)) != 0;
+	if(m_promotedAccesses.empty()) return false;
+	return m_promotedAccesses.count(PromotedKey(symbol->m_type, symbol->m_valueLow)) != 0;
 }
 
-uint32 CCodeGen_Wasm::GetPromotedLocal(const CSymbol* symbol) const
+const CCodeGen_Wasm::PROMOTED_ACCESS& CCodeGen_Wasm::GetPromotedAccess(const CSymbol* symbol) const
 {
-	return GetPromotedLocal(PromotedKey(symbol->m_type, symbol->m_valueLow));
+	auto accessIterator = m_promotedAccesses.find(PromotedKey(symbol->m_type, symbol->m_valueLow));
+	assert(accessIterator != std::end(m_promotedAccesses));
+	return accessIterator->second;
 }
 
 uint32 CCodeGen_Wasm::GetPromotedLocal(const PromotedKey& key) const
@@ -1562,6 +1647,130 @@ uint32 CCodeGen_Wasm::GetPromotedLocal(const PromotedKey& key) const
 	default:
 		assert(false);
 		return 0;
+	}
+}
+
+void CCodeGen_Wasm::EmitLocalGet(uint32 localIdx)
+{
+	m_functionStream.Write8(Wasm::INST_LOCAL_GET);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, localIdx);
+}
+
+void CCodeGen_Wasm::EmitLocalSet(uint32 localIdx)
+{
+	m_functionStream.Write8(Wasm::INST_LOCAL_SET);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, localIdx);
+}
+
+static uint8 GetLaneOpcode(SYM_TYPE type, bool replace)
+{
+	switch(type)
+	{
+	case SYM_RELATIVE:
+		return replace ? Wasm::INST_I32x4_REPLACE_LANE : Wasm::INST_I32x4_EXTRACT_LANE;
+	case SYM_FP_RELATIVE32:
+		return replace ? Wasm::INST_F32x4_REPLACE_LANE : Wasm::INST_F32x4_EXTRACT_LANE;
+	case SYM_RELATIVE64:
+		return replace ? Wasm::INST_I64x2_REPLACE_LANE : Wasm::INST_I64x2_EXTRACT_LANE;
+	default:
+		assert(false);
+		return 0;
+	}
+}
+
+void CCodeGen_Wasm::PushPromoted(const CSymbol* symbol)
+{
+	const auto& access = GetPromotedAccess(symbol);
+	EmitLocalGet(GetPromotedLocal(access.container));
+	switch(access.kind)
+	{
+	case PROMOTED_WHOLE:
+		break;
+	case PROMOTED_LANE:
+		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+		CWasmModuleBuilder::WriteULeb128(m_functionStream, GetLaneOpcode(symbol->m_type, false));
+		m_functionStream.Write8(static_cast<uint8>(access.lane));
+		break;
+	case PROMOTED_BITCAST:
+		m_functionStream.Write8(Wasm::INST_F32_REINTERPRET_I32);
+		break;
+	}
+}
+
+void CCodeGen_Wasm::CommitPromoted(const CSymbol* symbol)
+{
+	//Value to store is on the stack
+	const auto& access = GetPromotedAccess(symbol);
+	uint32 containerLocal = GetPromotedLocal(access.container);
+	switch(access.kind)
+	{
+	case PROMOTED_WHOLE:
+		EmitLocalSet(containerLocal);
+		break;
+	case PROMOTED_LANE:
+	{
+		uint32 scratch = (symbol->m_type == SYM_RELATIVE) ? m_scratchI32Local : (symbol->m_type == SYM_RELATIVE64) ? m_scratchI64Local : m_scratchF32Local;
+		EmitLocalSet(scratch);
+		EmitLocalGet(containerLocal);
+		EmitLocalGet(scratch);
+		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+		CWasmModuleBuilder::WriteULeb128(m_functionStream, GetLaneOpcode(symbol->m_type, true));
+		m_functionStream.Write8(static_cast<uint8>(access.lane));
+		EmitLocalSet(containerLocal);
+	}
+	break;
+	case PROMOTED_BITCAST:
+		m_functionStream.Write8(Wasm::INST_I32_REINTERPRET_F32);
+		EmitLocalSet(containerLocal);
+		break;
+	}
+}
+
+void CCodeGen_Wasm::PushPromotedBits(const CSymbol* symbol)
+{
+	//Pushes the raw bits of a promoted f32 symbol as an i32
+	assert(symbol->m_type == SYM_FP_RELATIVE32);
+	const auto& access = GetPromotedAccess(symbol);
+	EmitLocalGet(GetPromotedLocal(access.container));
+	switch(access.kind)
+	{
+	case PROMOTED_WHOLE:
+		m_functionStream.Write8(Wasm::INST_I32_REINTERPRET_F32);
+		break;
+	case PROMOTED_LANE:
+		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+		CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I32x4_EXTRACT_LANE);
+		m_functionStream.Write8(static_cast<uint8>(access.lane));
+		break;
+	case PROMOTED_BITCAST:
+		break;
+	}
+}
+
+void CCodeGen_Wasm::CommitPromotedBits(const CSymbol* symbol)
+{
+	//Stores raw bits (i32 on the stack) into a promoted f32 symbol
+	assert(symbol->m_type == SYM_FP_RELATIVE32);
+	const auto& access = GetPromotedAccess(symbol);
+	uint32 containerLocal = GetPromotedLocal(access.container);
+	switch(access.kind)
+	{
+	case PROMOTED_WHOLE:
+		m_functionStream.Write8(Wasm::INST_F32_REINTERPRET_I32);
+		EmitLocalSet(containerLocal);
+		break;
+	case PROMOTED_LANE:
+		EmitLocalSet(m_scratchI32Local);
+		EmitLocalGet(containerLocal);
+		EmitLocalGet(m_scratchI32Local);
+		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+		CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I32x4_REPLACE_LANE);
+		m_functionStream.Write8(static_cast<uint8>(access.lane));
+		EmitLocalSet(containerLocal);
+		break;
+	case PROMOTED_BITCAST:
+		EmitLocalSet(containerLocal);
+		break;
 	}
 }
 
@@ -1593,15 +1802,13 @@ void CCodeGen_Wasm::EmitPromotedLoad(const PromotedKey& key)
 		break;
 	}
 	CWasmModuleBuilder::WriteULeb128(m_functionStream, key.second);
-	m_functionStream.Write8(Wasm::INST_LOCAL_SET);
-	CWasmModuleBuilder::WriteULeb128(m_functionStream, GetPromotedLocal(key));
+	EmitLocalSet(GetPromotedLocal(key));
 }
 
 void CCodeGen_Wasm::EmitPromotedStore(const PromotedKey& key)
 {
 	PushContext();
-	m_functionStream.Write8(Wasm::INST_LOCAL_GET);
-	CWasmModuleBuilder::WriteULeb128(m_functionStream, GetPromotedLocal(key));
+	EmitLocalGet(GetPromotedLocal(key));
 	switch(key.first)
 	{
 	case SYM_RELATIVE:

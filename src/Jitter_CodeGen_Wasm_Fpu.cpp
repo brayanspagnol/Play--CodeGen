@@ -38,8 +38,7 @@ void CCodeGen_Wasm::PushRelativeFp32(CSymbol* symbol)
 {
 	if(IsPromoted(symbol))
 	{
-		m_functionStream.Write8(Wasm::INST_LOCAL_GET);
-		CWasmModuleBuilder::WriteULeb128(m_functionStream, GetPromotedLocal(symbol));
+		PushPromoted(symbol);
 		return;
 	}
 	PushRelativeAddress(symbol);
@@ -194,8 +193,7 @@ void CCodeGen_Wasm::Emit_Fp_ToSingleI32_MemMem(const STATEMENT& statement)
 	//Can't use PrepareSymbolUse here because src1 is a f32 and we need an i32
 	if(IsPromoted(src1))
 	{
-		PrepareSymbolUse(src1);
-		m_functionStream.Write8(Wasm::INST_I32_REINTERPRET_F32);
+		PushPromotedBits(src1);
 	}
 	else
 	{
@@ -226,8 +224,7 @@ void CCodeGen_Wasm::Emit_Fp_ToInt32TruncS_MemMem(const STATEMENT& statement)
 	//Can't use CommitSymbol here since we got a i32 on the stack and our dst symbol is a f32.
 	if(IsPromoted(dst))
 	{
-		m_functionStream.Write8(Wasm::INST_F32_REINTERPRET_I32);
-		CommitSymbol(dst);
+		CommitPromotedBits(dst);
 	}
 	else
 	{
