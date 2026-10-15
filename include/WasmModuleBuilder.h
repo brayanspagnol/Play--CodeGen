@@ -35,12 +35,25 @@ public:
 	//Import a second funcref table, env.blockTable (used by return_call_indirect ... table 1)
 	void SetImportsBlockTable(bool);
 
+	void SetFunctionTypeIndex(uint32);
 	void WriteModule(Framework::CStream&);
 
+	//Builds one module that holds the functions of several single-function modules written by
+	//WriteModule (canonical type numbering: bodies are copied unchanged). Function k is exported as
+	//"f<k>". Returns an empty vector if a module has an unexpected layout.
+	struct MODULE_BYTES
+	{
+		const uint8* data;
+		uint32 size;
+	};
+	static std::vector<uint8> BuildBatchModule(const std::vector<MODULE_BYTES>&);
+
 private:
-	void WriteSectionHeader(Framework::CStream&, uint8, uint32);
+	static void WriteSectionHeader(Framework::CStream&, uint8, uint32);
+	void WriteImportSection(Framework::CStream&);
 
 	std::vector<FUNCTION_TYPE> m_functionTypes;
 	std::vector<FUNCTION> m_functions;
 	bool m_importsBlockTable = false;
+	uint32 m_functionTypeIndex = 0;
 };

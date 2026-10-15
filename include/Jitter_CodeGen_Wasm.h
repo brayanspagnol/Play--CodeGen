@@ -5,6 +5,7 @@
 #include <vector>
 #include "Jitter_CodeGen.h"
 #include "MemStream.h"
+#include "WasmModuleBuilder.h"
 
 class CWasmModuleBuilder;
 
@@ -105,6 +106,36 @@ namespace Jitter
 		};
 		void PreparePromotion(const StatementList&);
 		bool IsPromoted(const CSymbol*) const;
+		bool TryEmitStorePair64(const STATEMENT&, const STATEMENT&);
+		void Emit_LoadFromPage(const STATEMENT&);
+		void Emit_StoreAtPage(const STATEMENT&);
+		void EmitPageEntry(const STATEMENT&);
+		void EmitHandlerCall(uintptr_t);
+		uint32 m_pageAddressLocal = 0;
+		uint32 m_pageEntryLocal = 0;
+	public:
+		//Slow path handlers of OP_LOADFROMPAGE/OP_STOREATPAGE (registered in CWasmFunctionRegistry):
+		//loads are uint32/uint64 (void* ctx, uint32 address), stores void (void* ctx, value, uint32 address)
+		struct PAGE_ACCESS_HANDLERS
+		{
+			uintptr_t load8 = 0;
+			uintptr_t load16 = 0;
+			uintptr_t load32 = 0;
+			uintptr_t load64 = 0;
+			uintptr_t store8 = 0;
+			uintptr_t store16 = 0;
+			uintptr_t store32 = 0;
+			uintptr_t store64 = 0;
+			uint32 pageShift = 12;
+		};
+		static void SetPageAccessHandlers(const PAGE_ACCESS_HANDLERS&);
+		bool SupportsPageAccess() const override;
+
+		static uint32 GetCanonicalSignatureIndex(const std::string&);
+		static CWasmModuleBuilder::FUNCTION_TYPE GetCanonicalFunctionType(uint32);
+
+	private:
+		static PAGE_ACCESS_HANDLERS m_pageAccessHandlers;
 		const PROMOTED_ACCESS& GetPromotedAccess(const CSymbol*) const;
 		uint32 GetPromotedLocal(const PromotedKey&) const;
 		void PushPromoted(const CSymbol*);

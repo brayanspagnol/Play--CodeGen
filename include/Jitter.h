@@ -129,6 +129,10 @@ namespace Jitter
 		void Store64AtRef();
 		void Store64AtRefIdx(size_t = sizeof(uint64));
 
+		//Page table access (OP_LOADFROMPAGE/OP_STOREATPAGE): stack is table ref, address[, value]
+		void LoadFromPage(uint32 size);
+		void StoreAtPage(uint32 size);
+
 		//64-bits
 		virtual void PushRel64(size_t);
 		void PushCst64(uint64);

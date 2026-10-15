@@ -1236,6 +1236,8 @@ bool CJitter::CopyPropagation(StatementList& statements)
 
 		//Some operations we can't propagate
 		if(outerStatement.op == OP_RETVAL) continue;
+		//Page loads may call a handler (I/O): keep them where they are
+		if(outerStatement.op == OP_LOADFROMPAGE) continue;
 
 		CSymbolRef* outerDstSymbol = outerStatement.dst.get();
 		if(outerDstSymbol == NULL) continue;
@@ -1351,6 +1353,7 @@ bool CJitter::CommonExpressionElimination(VERSIONED_STATEMENT_LIST& versionedSta
 		//If this is a statement defining a temporary
 		if(
 		    (statement.op != OP_RETVAL) &&
+		    (statement.op != OP_LOADFROMPAGE) && //Memory may have changed in between (stores, handlers)
 		    (statement.dst) &&
 		    (statement.dst->GetSymbol()->IsTemporary()))
 		{

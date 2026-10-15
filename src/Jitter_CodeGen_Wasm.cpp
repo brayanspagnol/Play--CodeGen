@@ -161,6 +161,9 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
 	{ OP_EXTLOW64,       MATCH_VARIABLE,       MATCH_MEMORY64,       MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_ExtLow64VarMem64                       },
 	{ OP_EXTHIGH64,      MATCH_VARIABLE,       MATCH_MEMORY64,       MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_ExtHigh64VarMem64                      },
 
+	{ OP_LOADFROMPAGE,   MATCH_ANY,            MATCH_REL_REF,        MATCH_ANY32,         MATCH_NIL,      &CCodeGen_Wasm::Emit_LoadFromPage                           },
+	{ OP_STOREATPAGE,    MATCH_NIL,            MATCH_REL_REF,        MATCH_ANY32,         MATCH_ANY,      &CCodeGen_Wasm::Emit_StoreAtPage                            },
+
 	{ OP_LABEL,          MATCH_NIL,            MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::MarkLabel                                   },
 
 	{ OP_MOV,            MATCH_NIL,            MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      nullptr                                                     },
@@ -284,6 +287,18 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 
 	BuildLabelFlows(statements);
 	PrepareSignatures(moduleBuilder, statements);
+	{
+		uint32 typeCount = 0;
+		for(const auto& signature : m_signatures)
+		{
+			typeCount = std::max(typeCount, signature.second + 1);
+		}
+		for(uint32 i = 0; i < typeCount; i++)
+		{
+			moduleBuilder.AddFunctionType(GetCanonicalFunctionType(i));
+		}
+		moduleBuilder.SetFunctionTypeIndex(m_signatures["vi"]);
+	}
 	PrepareLocalVars(statements);
 	if(m_contextPromotion)
 	{
@@ -291,8 +306,15 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	}
 	EmitPromotedLoadAll();
 
-	for(const auto& statement : statements)
+	for(auto statementIterator = statements.begin(); statementIterator != statements.end(); statementIterator++)
 	{
+		const auto& statement = *statementIterator;
+		auto nextIterator = std::next(statementIterator);
+		if((nextIterator != statements.end()) && TryEmitStorePair64(statement, *nextIterator))
+		{
+			statementIterator = nextIterator;
+			continue;
+		}
 		bool found = false;
 		auto begin = m_matchers.lower_bound(statement.op);
 		auto end = m_matchers.upper_bound(statement.op);
@@ -343,6 +365,306 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	moduleBuilder.WriteModule(*m_stream);
 
 	assert(m_params.empty());
+}
+
+//Two 32-bit stores that write both halves of one 64-bit context value (a sign-extended 32-bit
+//result: lo = x, hi = x >> 31, or two constants) become one 64-bit store. Besides saving a store,
+//a later 64-bit load of that value (64-bit compares in branches, DADDU, ...) can then be forwarded
+//from the store buffer; a 64-bit load that spans two separate 32-bit stores stalls until they retire.
+bool CCodeGen_Wasm::TryEmitStorePair64(const STATEMENT& first, const STATEMENT& second)
+{
+	auto isRelative = [](const SymbolRefPtr& ref) {
+		return ref && (ref->GetSymbol()->m_type == SYM_RELATIVE);
+	};
+	auto isConstant = [](const SymbolRefPtr& ref) {
+		return ref && (ref->GetSymbol()->m_type == SYM_CONSTANT);
+	};
+	if(!isRelative(first.dst) || !isRelative(second.dst)) return false;
+	auto firstDst = first.dst->GetSymbol().get();
+	auto secondDst = second.dst->GetSymbol().get();
+	if(IsPromoted(firstDst) || IsPromoted(secondDst)) return false;
+
+	//Two constants, any order
+	if((first.op == OP_MOV) && (second.op == OP_MOV) && isConstant(first.src1) && isConstant(second.src1))
+	{
+		const STATEMENT* lo = nullptr;
+		const STATEMENT* hi = nullptr;
+		if(secondDst->m_valueLow == firstDst->m_valueLow + 4)
+		{
+			lo = &first;
+			hi = &second;
+		}
+		else if(firstDst->m_valueLow == secondDst->m_valueLow + 4)
+		{
+			lo = &second;
+			hi = &first;
+		}
+		else
+		{
+			return false;
+		}
+		uint64 value = static_cast<uint64>(lo->src1->GetSymbol()->m_valueLow) |
+		               (static_cast<uint64>(hi->src1->GetSymbol()->m_valueLow) << 32);
+		PushRelativeAddress(lo->dst->GetSymbol().get());
+		m_functionStream.Write8(Wasm::INST_I64_CONST);
+		CWasmModuleBuilder::WriteSLeb128(m_functionStream, static_cast<int64>(value));
+		m_functionStream.Write8(Wasm::INST_I64_STORE);
+		m_functionStream.Write8(0x03);
+		m_functionStream.Write8(0x00);
+		return true;
+	}
+
+	//hi = x >> 31 (arithmetic) and lo = x, any order
+	auto isSignOf = [&](const STATEMENT& statement) {
+		return (statement.op == OP_SRA) && isConstant(statement.src2) && (statement.src2->GetSymbol()->m_valueLow == 31);
+	};
+	const STATEMENT* sra = nullptr;
+	const STATEMENT* mov = nullptr;
+	if(isSignOf(first) && (second.op == OP_MOV))
+	{
+		sra = &first;
+		mov = &second;
+	}
+	else if((first.op == OP_MOV) && isSignOf(second))
+	{
+		mov = &first;
+		sra = &second;
+	}
+	else
+	{
+		return false;
+	}
+	auto loDst = mov->dst->GetSymbol().get();
+	auto hiDst = sra->dst->GetSymbol().get();
+	if(hiDst->m_valueLow != loDst->m_valueLow + 4) return false;
+	auto value = mov->src1->GetSymbol().get();
+	if(!sra->src1->GetSymbol()->Equals(value)) return false;
+	if((value->m_type != SYM_TEMPORARY) && (value->m_type != SYM_RELATIVE)) return false;
+	//If the sign store comes first and its destination is the source, the low store would see the new value
+	if((sra == &first) && value->Equals(hiDst)) return false;
+	PushRelativeAddress(loDst);
+	PrepareSymbolUse(value);
+	m_functionStream.Write8(Wasm::INST_I64_EXTEND_I32_S);
+	m_functionStream.Write8(Wasm::INST_I64_STORE);
+	m_functionStream.Write8(0x03);
+	m_functionStream.Write8(0x00);
+	return true;
+}
+
+CCodeGen_Wasm::PAGE_ACCESS_HANDLERS CCodeGen_Wasm::m_pageAccessHandlers;
+
+void CCodeGen_Wasm::SetPageAccessHandlers(const PAGE_ACCESS_HANDLERS& handlers)
+{
+	m_pageAccessHandlers = handlers;
+}
+
+bool CCodeGen_Wasm::SupportsPageAccess() const
+{
+	return m_pageAccessHandlers.load32 != 0;
+}
+
+//address -> m_pageAddressLocal, page table entry -> m_pageEntryLocal (left on the stack too)
+void CCodeGen_Wasm::EmitPageEntry(const STATEMENT& statement)
+{
+	PrepareSymbolUse(statement.src2->GetSymbol().get());
+	EmitLocalSet(m_pageAddressLocal);
+	PrepareSymbolUse(statement.src1->GetSymbol().get());
+	EmitLocalGet(m_pageAddressLocal);
+	m_functionStream.Write8(Wasm::INST_I32_CONST);
+	CWasmModuleBuilder::WriteSLeb128(m_functionStream, m_pageAccessHandlers.pageShift);
+	m_functionStream.Write8(Wasm::INST_I32_SHR_U);
+	m_functionStream.Write8(Wasm::INST_I32_CONST);
+	m_functionStream.Write8(2);
+	m_functionStream.Write8(Wasm::INST_I32_SHL);
+	m_functionStream.Write8(Wasm::INST_I32_ADD);
+	m_functionStream.Write8(Wasm::INST_I32_LOAD);
+	m_functionStream.Write8(0x02);
+	m_functionStream.Write8(0x00);
+	m_functionStream.Write8(0x22); //local.tee
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, m_pageEntryLocal);
+}
+
+//Operands (context, ...) already pushed
+void CCodeGen_Wasm::EmitHandlerCall(uintptr_t handler)
+{
+	auto fctInfo = CWasmFunctionRegistry::FindFunction(handler);
+	assert(fctInfo);
+	auto sigIdxIterator = m_signatures.find(fctInfo->signature);
+	assert(sigIdxIterator != std::end(m_signatures));
+	m_functionStream.Write8(Wasm::INST_I32_CONST);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, fctInfo->id);
+	m_functionStream.Write8(Wasm::INST_CALL_INDIRECT);
+	m_functionStream.Write8(sigIdxIterator->second);
+	m_functionStream.Write8(0x00);
+}
+
+//dst = entry ? load(entry + (address & (pageSize - size))) : handler(context, address)
+void CCodeGen_Wasm::Emit_LoadFromPage(const STATEMENT& statement)
+{
+	auto dst = statement.dst->GetSymbol().get();
+	uint32 size = static_cast<uint32>(statement.jmpCondition);
+	const auto& h = m_pageAccessHandlers;
+
+	PrepareSymbolDef(dst);
+	EmitPageEntry(statement);
+	m_functionStream.Write8(Wasm::INST_IF);
+	m_functionStream.Write8((size == 16) ? Wasm::TYPE_V128 : (size == 8) ? Wasm::TYPE_I64 : Wasm::TYPE_I32);
+	{
+		EmitLocalGet(m_pageEntryLocal);
+		EmitLocalGet(m_pageAddressLocal);
+		m_functionStream.Write8(Wasm::INST_I32_CONST);
+		CWasmModuleBuilder::WriteSLeb128(m_functionStream, (1 << h.pageShift) - size);
+		m_functionStream.Write8(Wasm::INST_I32_AND);
+		m_functionStream.Write8(Wasm::INST_I32_ADD);
+		switch(size)
+		{
+		case 1:
+			m_functionStream.Write8(Wasm::INST_I32_LOAD8_U);
+			m_functionStream.Write8(0x00);
+			break;
+		case 2:
+			m_functionStream.Write8(Wasm::INST_I32_LOAD16_U);
+			m_functionStream.Write8(0x01);
+			break;
+		case 4:
+			m_functionStream.Write8(Wasm::INST_I32_LOAD);
+			m_functionStream.Write8(0x02);
+			break;
+		case 8:
+			m_functionStream.Write8(Wasm::INST_I64_LOAD);
+			m_functionStream.Write8(0x03);
+			break;
+		case 16:
+			m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+			m_functionStream.Write8(Wasm::INST_V128_LOAD);
+			m_functionStream.Write8(0x04);
+			break;
+		default:
+			assert(false);
+			break;
+		}
+		m_functionStream.Write8(0x00); //offset
+	}
+	m_functionStream.Write8(Wasm::INST_ELSE);
+	{
+		//The handler gets the context: it must see our values and we must see its changes
+		EmitPromotedStoreDirty();
+		if(size == 16)
+		{
+			//Four words (no 128-bit returns), quadword aligned
+			for(uint32 i = 0; i < 4; i++)
+			{
+				PushContext();
+				EmitLocalGet(m_pageAddressLocal);
+				m_functionStream.Write8(Wasm::INST_I32_CONST);
+				CWasmModuleBuilder::WriteSLeb128(m_functionStream, static_cast<int32>(~0x0F));
+				m_functionStream.Write8(Wasm::INST_I32_AND);
+				m_functionStream.Write8(Wasm::INST_I32_CONST);
+				CWasmModuleBuilder::WriteSLeb128(m_functionStream, i * 4);
+				m_functionStream.Write8(Wasm::INST_I32_ADD);
+				EmitHandlerCall(h.load32);
+				m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+				if(i == 0)
+				{
+					m_functionStream.Write8(0x11); //i32x4.splat
+				}
+				else
+				{
+					m_functionStream.Write8(Wasm::INST_I32x4_REPLACE_LANE);
+					m_functionStream.Write8(i);
+				}
+			}
+		}
+		else
+		{
+			PushContext();
+			EmitLocalGet(m_pageAddressLocal);
+			EmitHandlerCall((size == 1) ? h.load8 : (size == 2) ? h.load16 : (size == 8) ? h.load64 : h.load32);
+		}
+		EmitPromotedLoadAll();
+	}
+	m_functionStream.Write8(Wasm::INST_END);
+	CommitSymbol(dst);
+}
+
+void CCodeGen_Wasm::Emit_StoreAtPage(const STATEMENT& statement)
+{
+	auto value = statement.src3->GetSymbol().get();
+	uint32 size = static_cast<uint32>(statement.jmpCondition);
+	const auto& h = m_pageAccessHandlers;
+
+	EmitPageEntry(statement);
+	m_functionStream.Write8(Wasm::INST_IF);
+	m_functionStream.Write8(Wasm::BLOCK_TYPE_VOID);
+	{
+		EmitLocalGet(m_pageEntryLocal);
+		EmitLocalGet(m_pageAddressLocal);
+		m_functionStream.Write8(Wasm::INST_I32_CONST);
+		CWasmModuleBuilder::WriteSLeb128(m_functionStream, (1 << h.pageShift) - size);
+		m_functionStream.Write8(Wasm::INST_I32_AND);
+		m_functionStream.Write8(Wasm::INST_I32_ADD);
+		PrepareSymbolUse(value);
+		switch(size)
+		{
+		case 1:
+			m_functionStream.Write8(Wasm::INST_I32_STORE8);
+			m_functionStream.Write8(0x00);
+			break;
+		case 2:
+			m_functionStream.Write8(Wasm::INST_I32_STORE16);
+			m_functionStream.Write8(0x01);
+			break;
+		case 4:
+			m_functionStream.Write8(Wasm::INST_I32_STORE);
+			m_functionStream.Write8(0x02);
+			break;
+		case 8:
+			m_functionStream.Write8(Wasm::INST_I64_STORE);
+			m_functionStream.Write8(0x03);
+			break;
+		case 16:
+			m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+			m_functionStream.Write8(Wasm::INST_V128_STORE);
+			m_functionStream.Write8(0x04);
+			break;
+		default:
+			assert(false);
+			break;
+		}
+		m_functionStream.Write8(0x00); //offset
+	}
+	m_functionStream.Write8(Wasm::INST_ELSE);
+	{
+		EmitPromotedStoreDirty();
+		if(size == 16)
+		{
+			for(uint32 i = 0; i < 4; i++)
+			{
+				PushContext();
+				PrepareSymbolUse(value);
+				m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+				m_functionStream.Write8(Wasm::INST_I32x4_EXTRACT_LANE);
+				m_functionStream.Write8(i);
+				EmitLocalGet(m_pageAddressLocal);
+				m_functionStream.Write8(Wasm::INST_I32_CONST);
+				CWasmModuleBuilder::WriteSLeb128(m_functionStream, static_cast<int32>(~0x0F));
+				m_functionStream.Write8(Wasm::INST_I32_AND);
+				m_functionStream.Write8(Wasm::INST_I32_CONST);
+				CWasmModuleBuilder::WriteSLeb128(m_functionStream, i * 4);
+				m_functionStream.Write8(Wasm::INST_I32_ADD);
+				EmitHandlerCall(h.store32);
+			}
+		}
+		else
+		{
+			PushContext();
+			PrepareSymbolUse(value);
+			EmitLocalGet(m_pageAddressLocal);
+			EmitHandlerCall((size == 1) ? h.store8 : (size == 2) ? h.store16 : (size == 8) ? h.store64 : h.store32);
+		}
+		EmitPromotedLoadAll();
+	}
+	m_functionStream.Write8(Wasm::INST_END);
 }
 
 void CCodeGen_Wasm::SetStream(Framework::CStream* stream)
@@ -548,6 +870,21 @@ void CCodeGen_Wasm::PrepareSignatures(CWasmModuleBuilder& moduleBuilder, const S
 
 	for(const auto& statement : statements)
 	{
+		if((statement.op == OP_LOADFROMPAGE) || (statement.op == OP_STOREATPAGE))
+		{
+			bool isLoad = (statement.op == OP_LOADFROMPAGE);
+			uint32 size = static_cast<uint32>(statement.jmpCondition);
+			const auto& h = m_pageAccessHandlers;
+			uintptr_t handler = isLoad ? ((size == 1) ? h.load8 : (size == 2) ? h.load16 : (size == 8) ? h.load64 : h.load32)
+			                           : ((size == 1) ? h.store8 : (size == 2) ? h.store16 : (size == 8) ? h.store64 : h.store32);
+			auto fctInfo = CWasmFunctionRegistry::FindFunction(handler);
+			assert(fctInfo);
+			if(m_signatures.find(fctInfo->signature) == std::end(m_signatures))
+			{
+				RegisterSignature(moduleBuilder, fctInfo->signature);
+			}
+			continue;
+		}
 		if(statement.op != OP_CALL) continue;
 
 		auto src1 = statement.src1->GetSymbol().get();
@@ -566,50 +903,75 @@ void CCodeGen_Wasm::PrepareSignatures(CWasmModuleBuilder& moduleBuilder, const S
 	}
 }
 
-void CCodeGen_Wasm::RegisterSignature(CWasmModuleBuilder& moduleBuilder, std::string signature)
+//Signatures are "<result><params>" over v (void, result only), i (i32) and j (i64), at most 4 params.
+//Every module numbers them the same way (by param count, then result, then param types), so function
+//bodies can be moved between modules unchanged (see CWasmModuleBuilder::BuildBatchModule).
+uint32 CCodeGen_Wasm::GetCanonicalSignatureIndex(const std::string& signature)
 {
-	CWasmModuleBuilder::FUNCTION_TYPE functionType;
-
+	uint32 paramCount = static_cast<uint32>(signature.size()) - 1;
+	if(signature.empty() || (paramCount > 4))
+	{
+		throw std::runtime_error("Unsupported signature.");
+	}
+	uint32 base = 3 * ((1 << paramCount) - 1);
+	uint32 result = 0;
 	switch(signature[0])
 	{
 	case 'v':
+		result = 0;
 		break;
 	case 'i':
-		functionType.results.push_back(Wasm::TYPE_I32);
+		result = 1;
 		break;
 	case 'j':
-		functionType.results.push_back(Wasm::TYPE_I64);
+		result = 2;
 		break;
 	default:
-		assert(false);
-		break;
+		throw std::runtime_error("Unsupported signature.");
 	}
-
+	uint32 params = 0;
 	for(uint32 i = 1; i < signature.size(); i++)
 	{
-		switch(signature[i])
+		if((signature[i] != 'i') && (signature[i] != 'j'))
 		{
-		case 'i':
-			functionType.params.push_back(Wasm::TYPE_I32);
-			break;
-		case 'j':
-			functionType.params.push_back(Wasm::TYPE_I64);
-			break;
-		default:
-			assert(false);
-			break;
+			throw std::runtime_error("Unsupported signature.");
 		}
+		params = (params << 1) | ((signature[i] == 'j') ? 1 : 0);
 	}
+	return base + (result << paramCount) + params;
+}
 
-	moduleBuilder.AddFunctionType(std::move(functionType));
+CWasmModuleBuilder::FUNCTION_TYPE CCodeGen_Wasm::GetCanonicalFunctionType(uint32 index)
+{
+	uint32 paramCount = 0;
+	while(index >= 3 * ((2 << paramCount) - 1))
+	{
+		paramCount++;
+	}
+	index -= 3 * ((1 << paramCount) - 1);
+	CWasmModuleBuilder::FUNCTION_TYPE functionType;
+	uint32 result = index >> paramCount;
+	if(result == 1) functionType.results.push_back(Wasm::TYPE_I32);
+	if(result == 2) functionType.results.push_back(Wasm::TYPE_I64);
+	for(uint32 i = 0; i < paramCount; i++)
+	{
+		bool isI64 = (index >> (paramCount - 1 - i)) & 1;
+		functionType.params.push_back(isI64 ? Wasm::TYPE_I64 : Wasm::TYPE_I32);
+	}
+	return functionType;
+}
 
-	m_signatures.insert(std::make_pair(signature, static_cast<uint32>(m_signatures.size())));
+void CCodeGen_Wasm::RegisterSignature(CWasmModuleBuilder&, std::string signature)
+{
+	m_signatures.insert(std::make_pair(signature, GetCanonicalSignatureIndex(signature)));
 }
 
 void CCodeGen_Wasm::PrepareLocalVars(const StatementList& statements)
 {
+	bool usesPageAccess = false;
 	for(const auto& statement : statements)
 	{
+		usesPageAccess |= (statement.op == OP_LOADFROMPAGE) || (statement.op == OP_STOREATPAGE);
 		statement.VisitOperands(
 		    [this](const SymbolRefPtr& symbolRef, bool isDef) {
 			    auto symbol = symbolRef->GetSymbol();
@@ -645,6 +1007,12 @@ void CCodeGen_Wasm::PrepareLocalVars(const StatementList& statements)
 				    break;
 			    }
 		    });
+	}
+	if(usesPageAccess)
+	{
+		//Scratch i32 locals (absolute indexes: the first local is the context parameter)
+		m_pageAddressLocal = 1 + m_localI32Count++;
+		m_pageEntryLocal = 1 + m_localI32Count++;
 	}
 }
 

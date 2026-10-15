@@ -59,6 +59,30 @@ EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle),
 	let fctId = addFunction(fct, 'vi');
 	return fctId;
 });
+EM_JS(int, WasmCreateBatch, (uintptr_t code, uintptr_t size, int count, int* fctIds),
+{
+	try
+	{
+		let module = new WebAssembly.Module(HEAP8.subarray(code, code + size));
+		let instance = new WebAssembly.Instance(module, {
+			env: {
+				memory: wasmMemory,
+				fctTable : Module.codeGenImportTable,
+				blockTable : wasmTable
+			}
+		});
+		for(let i = 0; i < count; i++)
+		{
+			HEAP32[(fctIds >> 2) + i] = addFunction(instance.exports["f" + i], 'vi');
+		}
+		return 1;
+	}
+	catch(e)
+	{
+		err("JIT batch module failed: " + e);
+		return 0;
+	}
+});
 EM_JS(void, WasmDeleteFunction, (int fctId),
 {
 	removeFunction(fctId);
@@ -230,6 +254,25 @@ void CMemoryFunction::EndModify()
 #endif
 	ClearCache();
 }
+
+#if defined(MEMFUNC_USE_WASM)
+std::vector<int> CMemoryFunction::CreateWasmBatch(const void* code, size_t size, uint32 count)
+{
+	std::vector<int> fctIds(count);
+	if(!WasmCreateBatch(reinterpret_cast<uintptr_t>(code), size, count, fctIds.data()))
+	{
+		fctIds.clear();
+	}
+	return fctIds;
+}
+
+void CMemoryFunction::ReplaceWasmFunction(int fctId)
+{
+	assert(m_code != nullptr);
+	WasmDeleteFunction(reinterpret_cast<int>(m_code));
+	m_code = reinterpret_cast<void*>(fctId);
+}
+#endif
 
 CMemoryFunction CMemoryFunction::CreateInstance()
 {

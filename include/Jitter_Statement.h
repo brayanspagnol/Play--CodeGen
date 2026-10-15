@@ -45,6 +45,12 @@ namespace Jitter
 		OP_STORE8ATREF,
 		OP_STORE16ATREF,
 
+		//Guest memory access through a page table (src1: table ref, src2: guest address, src3: value
+		//for stores; access size in jmpCondition). Pages without an entry go to slow path handlers
+		//registered with the code generator. Only used when CCodeGen::SupportsPageAccess().
+		OP_LOADFROMPAGE,
+		OP_STOREATPAGE,
+
 		OP_ADD64,
 		OP_SUB64,
 		OP_AND64,
