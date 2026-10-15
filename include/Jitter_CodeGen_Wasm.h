@@ -193,6 +193,7 @@ namespace Jitter
 		void Emit_RetVal_Tmp(const STATEMENT&);
 
 		void Emit_ExternJmp(const STATEMENT&);
+		void Emit_ExternJmpIdx(const STATEMENT&);
 
 		void Emit_Jmp(const STATEMENT&);
 		void Emit_CondJmp_AnyAny(const STATEMENT&);
@@ -289,6 +290,7 @@ namespace Jitter
 		ParamStack m_params;
 
 		bool m_contextPromotion = false;
+		bool m_usesBlockTable = false;
 		std::string m_functionName;
 		std::map<PromotedKey, uint32> m_promotedLocations; //Container -> group-relative local index
 		std::map<PromotedKey, PROMOTED_ACCESS> m_promotedAccesses;

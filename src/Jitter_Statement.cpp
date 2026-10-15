@@ -190,6 +190,9 @@ void Jitter::DumpStatementList(std::ostream& outputStream, const StatementList& 
 		case OP_EXTERNJMP_DYN:
 			outputStream << " EXTJMP_DYN ";
 			break;
+		case OP_EXTERNJMP_IDX:
+			outputStream << " EXTJMP_IDX ";
+			break;
 		case OP_LABEL:
 			outputStream << "LABEL_" << statement.jmpBlock << ":";
 			break;

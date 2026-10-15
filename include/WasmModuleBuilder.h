@@ -32,6 +32,8 @@ public:
 
 	void AddFunctionType(FUNCTION_TYPE);
 	void AddFunction(FUNCTION);
+	//Import a second funcref table, env.blockTable (used by return_call_indirect ... table 1)
+	void SetImportsBlockTable(bool);
 
 	void WriteModule(Framework::CStream&);
 
@@ -40,4 +42,5 @@ private:
 
 	std::vector<FUNCTION_TYPE> m_functionTypes;
 	std::vector<FUNCTION> m_functions;
+	bool m_importsBlockTable = false;
 };

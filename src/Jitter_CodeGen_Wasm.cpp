@@ -128,6 +128,7 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
 	{ OP_RETVAL,         MATCH_TEMPORARY,      MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_RetVal_Tmp                             },
 
 	{ OP_EXTERNJMP,      MATCH_NIL,            MATCH_CONSTANTPTR,    MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_ExternJmp                              },
+	{ OP_EXTERNJMP_IDX,  MATCH_NIL,            MATCH_ANY32,          MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_ExternJmpIdx                           },
 
 	{ OP_JMP,            MATCH_NIL,            MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Jmp                                    },
 
@@ -276,6 +277,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	m_isInsideLoop = false;
 	m_currentBlockDepth = 0;
 	m_loopBlock = -1;
+	m_usesBlockTable = false;
 	m_promotedLocations.clear();
 	m_promotedAccesses.clear();
 	m_promotedDirty.clear();
@@ -336,6 +338,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	function.name = std::move(m_functionName);
 	m_functionName.clear();
 
+	moduleBuilder.SetImportsBlockTable(m_usesBlockTable);
 	moduleBuilder.AddFunction(std::move(function));
 	moduleBuilder.WriteModule(*m_stream);
 
@@ -1190,6 +1193,31 @@ void CCodeGen_Wasm::Emit_ExternJmp(const STATEMENT& statement)
 	m_functionStream.Write8(0x00);   //Table index
 
 	EmitPromotedLoadAll();
+}
+
+void CCodeGen_Wasm::Emit_ExternJmpIdx(const STATEMENT& statement)
+{
+	//if(idx != 0) return_call_indirect idx(context) through table 1 (env.blockTable, the main module's function table)
+	auto src1 = statement.src1->GetSymbol().get();
+
+	EmitPromotedStoreDirty();
+
+	PrepareSymbolUse(src1);
+	m_functionStream.Write8(Wasm::INST_IF);
+	m_functionStream.Write8(Wasm::BLOCK_TYPE_VOID);
+
+	PushContext();
+	PrepareSymbolUse(src1);
+
+	auto sigIdxIterator = m_signatures.find("vi");
+	assert(sigIdxIterator != std::end(m_signatures));
+	m_functionStream.Write8(Wasm::INST_RETURN_CALL_INDIRECT);
+	m_functionStream.Write8(sigIdxIterator->second); //Signature index
+	m_functionStream.Write8(0x01);                   //Table index
+
+	m_functionStream.Write8(Wasm::INST_END);
+
+	m_usesBlockTable = true;
 }
 
 void CCodeGen_Wasm::Emit_Jmp(const STATEMENT& statement)

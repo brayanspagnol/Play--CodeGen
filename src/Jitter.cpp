@@ -329,6 +329,14 @@ void CJitter::JumpToDynamic(void* func)
 	InsertStatement(statement);
 }
 
+void CJitter::JumpToIndirect()
+{
+	STATEMENT statement;
+	statement.src1 = MakeSymbolRef(m_shadow.Pull());
+	statement.op = OP_EXTERNJMP_IDX;
+	InsertStatement(statement);
+}
+
 void CJitter::Lookup(uint32* table)
 {
 	throw std::exception();

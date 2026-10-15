@@ -176,6 +176,7 @@ namespace Jitter
 		OP_CONDJMP,
 		OP_EXTERNJMP,     //Pass control to another function with same signature (void (*)(void*)) and same input parameter
 		OP_EXTERNJMP_DYN, //Same as above, but destination can be changed at run time, cannot be used in AOT mode
+		OP_EXTERNJMP_IDX, //Wasm only: if src1 (function table index) is not 0, tail call that function (void (*)(void*)) with the same input parameter
 		OP_GOTO,
 		OP_BREAK,
 

@@ -139,7 +139,8 @@ void CJitter::AllocateRegisters(BASIC_BLOCK& basicBlock)
 			    (statement.op != OP_JMP) &&
 			    (statement.op != OP_CALL) &&
 			    (statement.op != OP_EXTERNJMP) &&
-			    (statement.op != OP_EXTERNJMP_DYN))
+			    (statement.op != OP_EXTERNJMP_DYN) &&
+			    (statement.op != OP_EXTERNJMP_IDX))
 			{
 				statementIterator++;
 			}

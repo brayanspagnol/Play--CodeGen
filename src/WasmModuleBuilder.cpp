@@ -75,6 +75,11 @@ void CWasmModuleBuilder::AddFunction(FUNCTION function)
 	m_functions.push_back(std::move(function));
 }
 
+void CWasmModuleBuilder::SetImportsBlockTable(bool importsBlockTable)
+{
+	m_importsBlockTable = importsBlockTable;
+}
+
 void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
 {
 	//We only support a single function at the moment
@@ -122,9 +127,11 @@ void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
 
 	//Section "Import"
 	{
-		WriteSectionHeader(stream, Wasm::SECTION_ID_IMPORT, 0x23);
+		//Table import: module name (1 + 3), field name (1 + n), kind, reftype, flags, initial
+		const uint32 blockTableImportSize = 4 + 1 + 10 + 4;
+		WriteSectionHeader(stream, Wasm::SECTION_ID_IMPORT, 0x23 + (m_importsBlockTable ? blockTableImportSize : 0));
 
-		stream.Write8(2); //Import vector size
+		stream.Write8(m_importsBlockTable ? 3 : 2); //Import vector size
 
 		//Import 0
 		WriteName(stream, "env");    //Import module name
@@ -141,6 +148,16 @@ void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
 		stream.Write8(0x70); //Funcref
 		stream.Write8(0x00); //Flags
 		stream.Write8(0x01); //Initial
+
+		if(m_importsBlockTable)
+		{
+			WriteName(stream, "env");
+			WriteName(stream, "blockTable");
+			stream.Write8(Wasm::IMPORT_EXPORT_TYPE_TABLE);
+			stream.Write8(0x70); //Funcref
+			stream.Write8(0x00); //Flags
+			stream.Write8(0x01); //Initial
+		}
 	}
 
 	//Section "Function"

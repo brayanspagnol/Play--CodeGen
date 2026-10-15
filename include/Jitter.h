@@ -81,6 +81,8 @@ namespace Jitter
 		void DivS();
 		void JumpTo(void*);
 		void JumpToDynamic(void*);
+		//Wasm only: pops a function table index, tail calls it if it is not 0 (falls through otherwise)
+		void JumpToIndirect();
 		void Lookup(uint32*);
 		void Lzc();
 		void Mult();
