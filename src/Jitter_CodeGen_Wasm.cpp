@@ -286,7 +286,10 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	m_promotedAccesses.clear();
 	m_promotedDirty.clear();
 
-	BuildLabelFlows(statements);
+	if(!m_structuredControlFlow)
+	{
+		BuildLabelFlows(statements);
+	}
 	PrepareSignatures(moduleBuilder, statements);
 	{
 		uint32 typeCount = 0;
@@ -307,45 +310,23 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	}
 	EmitPromotedLoadAll();
 
-	for(auto statementIterator = statements.begin(); statementIterator != statements.end(); statementIterator++)
+	if(m_structuredControlFlow)
 	{
-		const auto& statement = *statementIterator;
-		auto nextIterator = std::next(statementIterator);
-		if((nextIterator != statements.end()) && TryEmitStorePair64(statement, *nextIterator))
-		{
-			statementIterator = nextIterator;
-			continue;
-		}
-		bool found = false;
-		auto begin = m_matchers.lower_bound(statement.op);
-		auto end = m_matchers.upper_bound(statement.op);
-
-		for(auto matchIterator(begin); matchIterator != end; matchIterator++)
-		{
-			const auto& matcher(matchIterator->second);
-			if(!SymbolMatches(matcher.dstType, statement.dst)) continue;
-			if(!SymbolMatches(matcher.src1Type, statement.src1)) continue;
-			if(!SymbolMatches(matcher.src2Type, statement.src2)) continue;
-			if(!SymbolMatches(matcher.src3Type, statement.src3)) continue;
-			matcher.emitter(statement);
-			found = true;
-			break;
-		}
-		assert(found);
-		if(!found)
-		{
-			throw std::runtime_error("No suitable emitter found for statement.");
-		}
+		EmitStructured(statements);
 	}
-
-	//Terminate current block
-	assert(m_isInsideBlock);
-	m_functionStream.Write8(Wasm::INST_END);
-
-	//Terminate loop
-	if(m_isInsideLoop)
+	else
 	{
+		EmitStatementRange(statements.begin(), statements.end());
+
+		//Terminate current block
+		assert(m_isInsideBlock);
 		m_functionStream.Write8(Wasm::INST_END);
+
+		//Terminate loop
+		if(m_isInsideLoop)
+		{
+			m_functionStream.Write8(Wasm::INST_END);
+		}
 	}
 
 	EmitPromotedStoreDirty();
@@ -366,6 +347,40 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	moduleBuilder.WriteModule(*m_stream);
 
 	assert(m_params.empty());
+}
+
+void CCodeGen_Wasm::EmitStatementRange(StatementList::const_iterator begin, StatementList::const_iterator end)
+{
+	for(auto statementIterator = begin; statementIterator != end; statementIterator++)
+	{
+		const auto& statement = *statementIterator;
+		auto nextIterator = std::next(statementIterator);
+		if((nextIterator != end) && TryEmitStorePair64(statement, *nextIterator))
+		{
+			statementIterator = nextIterator;
+			continue;
+		}
+		bool found = false;
+		auto matchBegin = m_matchers.lower_bound(statement.op);
+		auto matchEnd = m_matchers.upper_bound(statement.op);
+
+		for(auto matchIterator(matchBegin); matchIterator != matchEnd; matchIterator++)
+		{
+			const auto& matcher(matchIterator->second);
+			if(!SymbolMatches(matcher.dstType, statement.dst)) continue;
+			if(!SymbolMatches(matcher.src1Type, statement.src1)) continue;
+			if(!SymbolMatches(matcher.src2Type, statement.src2)) continue;
+			if(!SymbolMatches(matcher.src3Type, statement.src3)) continue;
+			matcher.emitter(statement);
+			found = true;
+			break;
+		}
+		assert(found);
+		if(!found)
+		{
+			throw std::runtime_error("No suitable emitter found for statement.");
+		}
+	}
 }
 
 //Two 32-bit stores that write both halves of one 64-bit context value (a sign-extended 32-bit
@@ -884,6 +899,290 @@ void CCodeGen_Wasm::BuildLabelFlows(const StatementList& statements)
 		}
 	}
 #endif
+}
+
+//General structuring (SetStructuredControlFlow), Ramsey's dominator-tree emission ("Beyond Relooper",
+//ICFP 2022). Nodes are the Jitter's basic blocks: a label, statements, then an optional OP_JMP or
+//OP_CONDJMP (no jump: fall through to the next label, or out of the function after the last one).
+//- A node that is the target of a back edge is wrapped in a loop.
+//- The dominator-tree children of a node that have two or more forward in-edges ("merge nodes") come
+//  right after the node, each one closing a block that the node's code is nested in (the child that is
+//  last in reverse postorder is the outermost block).
+//- A back edge is a br to its loop, a forward edge to a merge node a br to the end of its block, and a
+//  forward edge to any other node emits that node's subtree in place.
+//The function body sits in an outer block: leaving the function is a br to its end.
+void CCodeGen_Wasm::EmitStructured(const StatementList& statements)
+{
+	struct NODE
+	{
+		StatementList::const_iterator begin;
+		StatementList::const_iterator end; //The terminator (if any) is at end
+		bool hasTerminator = false;
+		int succ[2] = {-1, -1}; //OP_CONDJMP: {fall through, jump target}
+		int succCount = 0;
+	};
+	static const int EXIT = -1;
+
+	std::vector<NODE> nodes;
+	std::map<uint32, int> labelNodes;
+	assert(!statements.empty() && (statements.front().op == OP_LABEL));
+	for(auto statementIterator = statements.begin(); statementIterator != statements.end(); statementIterator++)
+	{
+		const auto& statement = *statementIterator;
+		if(statement.op == OP_LABEL)
+		{
+			labelNodes[statement.jmpBlock] = static_cast<int>(nodes.size());
+			NODE node;
+			node.begin = node.end = std::next(statementIterator);
+			nodes.push_back(node);
+		}
+		else
+		{
+			assert(!nodes.back().hasTerminator);
+			if((statement.op == OP_JMP) || (statement.op == OP_CONDJMP))
+			{
+				nodes.back().hasTerminator = true;
+			}
+			else
+			{
+				nodes.back().end = std::next(statementIterator);
+			}
+		}
+	}
+
+	int nodeCount = static_cast<int>(nodes.size());
+	auto findLabelNode = [&](uint32 label) {
+		auto labelNodeIterator = labelNodes.find(label);
+		assert(labelNodeIterator != std::end(labelNodes));
+		return labelNodeIterator->second;
+	};
+	for(int i = 0; i < nodeCount; i++)
+	{
+		auto& node = nodes[i];
+		int next = (i + 1 < nodeCount) ? (i + 1) : EXIT;
+		if(!node.hasTerminator)
+		{
+			node.succ[node.succCount++] = next;
+		}
+		else if(node.end->op == OP_JMP)
+		{
+			node.succ[node.succCount++] = findLabelNode(node.end->jmpBlock);
+		}
+		else
+		{
+			node.succ[node.succCount++] = next;
+			node.succ[node.succCount++] = findLabelNode(node.end->jmpBlock);
+		}
+	}
+
+	//Reverse postorder of the nodes reachable from the entry (unreachable nodes are not emitted)
+	std::vector<int> order;
+	std::vector<int> rpo(nodeCount, -1);
+	{
+		std::vector<int> postorder;
+		std::vector<bool> visited(nodeCount, false);
+		std::vector<std::pair<int, int>> stack = {{0, 0}};
+		visited[0] = true;
+		while(!stack.empty())
+		{
+			int x = stack.back().first;
+			int succIndex = stack.back().second;
+			if(succIndex < nodes[x].succCount)
+			{
+				stack.back().second++;
+				int y = nodes[x].succ[succIndex];
+				if((y != EXIT) && !visited[y])
+				{
+					visited[y] = true;
+					stack.push_back({y, 0});
+				}
+			}
+			else
+			{
+				postorder.push_back(x);
+				stack.pop_back();
+			}
+		}
+		order.assign(postorder.rbegin(), postorder.rend());
+		for(size_t i = 0; i < order.size(); i++)
+		{
+			rpo[order[i]] = static_cast<int>(i);
+		}
+	}
+
+	//Immediate dominators (Cooper, Harvey, Kennedy)
+	std::vector<std::vector<int>> preds(nodeCount);
+	for(int x : order)
+	{
+		for(int i = 0; i < nodes[x].succCount; i++)
+		{
+			int y = nodes[x].succ[i];
+			if(y != EXIT) preds[y].push_back(x);
+		}
+	}
+	std::vector<int> idom(nodeCount, -1);
+	idom[0] = 0;
+	for(bool changed = true; changed;)
+	{
+		changed = false;
+		for(size_t i = 1; i < order.size(); i++)
+		{
+			int x = order[i];
+			int newIdom = -1;
+			for(int p : preds[x])
+			{
+				if(idom[p] == -1) continue;
+				if(newIdom == -1)
+				{
+					newIdom = p;
+					continue;
+				}
+				int a = p;
+				int b = newIdom;
+				while(a != b)
+				{
+					while(rpo[a] > rpo[b]) a = idom[a];
+					while(rpo[b] > rpo[a]) b = idom[b];
+				}
+				newIdom = a;
+			}
+			if(idom[x] != newIdom)
+			{
+				idom[x] = newIdom;
+				changed = true;
+			}
+		}
+	}
+	auto dominates = [&](int a, int b) {
+		for(;;)
+		{
+			if(a == b) return true;
+			if(b == 0) return false;
+			b = idom[b];
+		}
+	};
+
+	//Back edges (target dominates source, else the graph is irreducible) and merge nodes
+	std::vector<int> forwardInCount(nodeCount, 0);
+	std::vector<bool> isLoopHeader(nodeCount, false);
+	for(int x : order)
+	{
+		for(int i = 0; i < nodes[x].succCount; i++)
+		{
+			int y = nodes[x].succ[i];
+			if(y == EXIT) continue;
+			if(rpo[y] <= rpo[x])
+			{
+				if(!dominates(y, x))
+				{
+					throw std::runtime_error("Irreducible control flow.");
+				}
+				isLoopHeader[y] = true;
+			}
+			else
+			{
+				forwardInCount[y]++;
+			}
+		}
+	}
+	std::vector<std::vector<int>> mergeChildren(nodeCount);
+	for(size_t i = 1; i < order.size(); i++)
+	{
+		int y = order[i];
+		if(forwardInCount[y] >= 2) mergeChildren[idom[y]].push_back(y);
+	}
+	for(auto& children : mergeChildren)
+	{
+		std::sort(children.begin(), children.end(), [&](int a, int b) { return rpo[a] > rpo[b]; });
+	}
+
+	enum CONTEXT_KIND
+	{
+		CONTEXT_BLOCK,
+		CONTEXT_LOOP,
+		CONTEXT_IF,
+		CONTEXT_EXIT,
+	};
+	std::vector<std::pair<CONTEXT_KIND, int>> context;
+	auto openScope = [&](uint8 instruction, CONTEXT_KIND kind, int node) {
+		m_functionStream.Write8(instruction);
+		m_functionStream.Write8(Wasm::BLOCK_TYPE_VOID);
+		context.push_back({kind, node});
+	};
+	auto closeScope = [&]() {
+		context.pop_back();
+		m_functionStream.Write8(Wasm::INST_END);
+	};
+	auto writeBranch = [&](CONTEXT_KIND kind, int node) {
+		for(size_t i = context.size(); i-- > 0;)
+		{
+			if((context[i].first == kind) && (context[i].second == node))
+			{
+				m_functionStream.Write8(Wasm::INST_BR);
+				CWasmModuleBuilder::WriteULeb128(m_functionStream, static_cast<uint32>(context.size() - 1 - i));
+				return;
+			}
+		}
+		assert(false);
+		throw std::runtime_error("Branch target not in scope.");
+	};
+
+	std::function<void(int)> doTree;
+	auto doBranch = [&](int from, int to) {
+		if(to == EXIT)
+			writeBranch(CONTEXT_EXIT, EXIT);
+		else if(rpo[to] <= rpo[from])
+			writeBranch(CONTEXT_LOOP, to);
+		else if(forwardInCount[to] >= 2)
+			writeBranch(CONTEXT_BLOCK, to);
+		else
+			doTree(to);
+	};
+	std::function<void(int, size_t)> nodeWithin = [&](int x, size_t mergeIndex) {
+		const auto& merges = mergeChildren[x];
+		if(mergeIndex < merges.size())
+		{
+			int y = merges[mergeIndex];
+			openScope(Wasm::INST_BLOCK, CONTEXT_BLOCK, y);
+			nodeWithin(x, mergeIndex + 1);
+			closeScope();
+			doTree(y);
+			return;
+		}
+		const auto& node = nodes[x];
+		EmitStatementRange(node.begin, node.end);
+		if(node.succCount == 1)
+		{
+			doBranch(x, node.succ[0]);
+		}
+		else
+		{
+			//The OP_CONDJMP emitter leaves the "don't jump" condition on the stack
+			EmitStatementRange(node.end, std::next(node.end));
+			openScope(Wasm::INST_IF, CONTEXT_IF, -1);
+			doBranch(x, node.succ[0]);
+			m_functionStream.Write8(Wasm::INST_ELSE);
+			doBranch(x, node.succ[1]);
+			closeScope();
+		}
+	};
+	doTree = [&](int x) {
+		if(isLoopHeader[x])
+		{
+			openScope(Wasm::INST_LOOP, CONTEXT_LOOP, x);
+			nodeWithin(x, 0);
+			closeScope();
+		}
+		else
+		{
+			nodeWithin(x, 0);
+		}
+	};
+
+	openScope(Wasm::INST_BLOCK, CONTEXT_EXIT, EXIT);
+	doTree(0);
+	closeScope();
+	assert(context.empty());
 }
 
 void CCodeGen_Wasm::PrepareSignatures(CWasmModuleBuilder& moduleBuilder, const StatementList& statements)
@@ -1852,6 +2151,11 @@ std::vector<std::pair<uint32, uint32>> CCodeGen_Wasm::m_volatileContextRanges;
 void CCodeGen_Wasm::SetContextPromotion(bool enabled)
 {
 	m_contextPromotion = enabled;
+}
+
+void CCodeGen_Wasm::SetStructuredControlFlow(bool enabled)
+{
+	m_structuredControlFlow = enabled;
 }
 
 void CCodeGen_Wasm::SetFunctionName(std::string name)

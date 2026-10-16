@@ -165,6 +165,8 @@ set(CodeGenTest_SRC
 	tests/Logic64Test.h
 	tests/LoopTest.cpp
 	tests/LoopTest.h
+	tests/StructuredFlowTest.cpp
+	tests/StructuredFlowTest.h
 	tests/LzcTest.cpp
 	tests/LzcTest.h
 	tests/Main.cpp

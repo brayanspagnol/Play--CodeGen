@@ -1,4 +1,7 @@
 #include "Jitter_CodeGenFactory.h"
+#ifdef __EMSCRIPTEN__
+#include "Jitter_CodeGen_Wasm.h"
+#endif
 
 #include "Crc32Test.h"
 #include "CursorTest.h"
@@ -11,6 +14,7 @@
 #include "LogicTest.h"
 #include "SelectTest.h"
 #include "LoopTest.h"
+#include "StructuredFlowTest.h"
 #include "AliasTest.h"
 #include "AliasTest2.h"
 #include "FpSingleTest.h"
@@ -120,6 +124,7 @@ static const TestFactoryFunction s_factories[] =
 	[] () { return new CHugeJumpTest(); },
 	[] () { return new CHugeJumpTestLiteral(); },
 	[] () { return new CLoopTest(); },
+	[] () { return new CStructuredFlowTest(); },
 	[] () { return new CNestedIfTest(); },
 	[] () { return new CLzcTest(); },
 	[] () { return new CAliasTest(); },
@@ -215,13 +220,23 @@ int main(int argc, const char** argv)
 {
 	PrepareExternalFunctions();
 	Jitter::CJitter jitter(Jitter::CreateCodeGen());
-	for(const auto& factory : s_factories)
-	{
-		auto test = factory();
-		test->Compile(jitter);
-		test->Run();
-		delete test;
-	}
+	auto runAll = [&]() {
+		for(const auto& factory : s_factories)
+		{
+			auto test = factory();
+			test->Compile(jitter);
+			test->Run();
+			delete test;
+		}
+	};
+	runAll();
+#ifdef __EMSCRIPTEN__
+	//Again with the general control flow structurer
+	auto wasmCodeGen = static_cast<Jitter::CCodeGen_Wasm*>(jitter.GetCodeGen());
+	wasmCodeGen->SetStructuredControlFlow(true);
+	runAll();
+	printf("All tests passed (pattern and structured control flow).\n");
+#endif
 	return 0;
 }
 

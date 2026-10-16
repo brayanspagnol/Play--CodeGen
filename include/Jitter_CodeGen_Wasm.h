@@ -67,6 +67,15 @@ namespace Jitter
 		static void RegisterVolatileContextRange(uint32 offset, uint32 size);
 		//Name for the next generated function (profiling); empty: no name section
 		void SetFunctionName(std::string);
+		//General control flow: any reducible graph of labels and jumps (several loops, jumps into
+		//enclosing scopes, ...) is structured with dominator-tree emission (Ramsey, "Beyond Relooper").
+		//Off: only the if/else and single loop patterns of BuildLabelFlows are supported.
+		//Irreducible graphs throw (callers must only build reducible ones).
+		void SetStructuredControlFlow(bool);
+		bool GetStructuredControlFlow() const
+		{
+			return m_structuredControlFlow;
+		}
 
 	private:
 		enum LABEL_FLOW
@@ -99,6 +108,8 @@ namespace Jitter
 		static CONSTMATCHER g_mdConstMatchers[];
 
 		void BuildLabelFlows(const StatementList&);
+		void EmitStatementRange(StatementList::const_iterator, StatementList::const_iterator);
+		void EmitStructured(const StatementList&);
 		void PrepareSignatures(CWasmModuleBuilder&, const StatementList&);
 		void RegisterSignature(CWasmModuleBuilder&, std::string);
 		void PrepareLocalVars(const StatementList&);
@@ -337,6 +348,7 @@ namespace Jitter
 		ParamStack m_params;
 
 		bool m_contextPromotion = false;
+		bool m_structuredControlFlow = false;
 		bool m_usesBlockTable = false;
 		std::string m_functionName;
 		std::map<PromotedKey, uint32> m_promotedLocations; //Container -> group-relative local index
