@@ -14,6 +14,11 @@ using namespace Jitter;
 
 void CJitter::AllocateRegisters(BASIC_BLOCK& basicBlock)
 {
+	//Nothing to allocate (e.g. WebAssembly): skip the liveness and alias scans, they would not change anything
+	if((m_codeGen->GetAvailableRegisterCount() == 0) && (m_codeGen->GetAvailableMdRegisterCount() == 0))
+	{
+		return;
+	}
 	auto& symbolTable = basicBlock.symbolTable;
 
 	std::multimap<unsigned int, STATEMENT> loadStatements;

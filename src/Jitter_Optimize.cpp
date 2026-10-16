@@ -1,6 +1,9 @@
 #include <assert.h>
 #include <vector>
 #include <algorithm>
+#include <set>
+#include <tuple>
+#include <unordered_set>
 #include "Jitter.h"
 #include "BitManip.h"
 
@@ -13,6 +16,42 @@
 #endif
 
 using namespace Jitter;
+
+namespace
+{
+	//Identity of a symbol as compared by CSymbol::Equals (plus a version for CSymbolRef::Equals)
+	struct SYMBOL_KEY
+	{
+		uint64 value = 0;
+		uint32 type = 0;
+		int version = 0;
+
+		bool operator==(const SYMBOL_KEY& rhs) const
+		{
+			return (value == rhs.value) && (type == rhs.type) && (version == rhs.version);
+		}
+	};
+
+	struct SYMBOL_KEY_HASH
+	{
+		size_t operator()(const SYMBOL_KEY& key) const
+		{
+			uint64 hash = key.value * 0x9E3779B97F4A7C15ULL;
+			hash ^= (static_cast<uint64>(key.type) << 32) | static_cast<uint32>(key.version);
+			hash *= 0xBF58476D1CE4E5B9ULL;
+			return static_cast<size_t>(hash ^ (hash >> 31));
+		}
+	};
+
+	SYMBOL_KEY MakeSymbolKey(const CSymbol* symbol, int version = 0)
+	{
+		SYMBOL_KEY key;
+		key.value = (static_cast<uint64>(symbol->m_valueHigh) << 32) | symbol->m_valueLow;
+		key.type = symbol->m_type;
+		key.version = version;
+		return key;
+	}
+}
 
 unsigned int CJitter::CRelativeVersionManager::GetRelativeVersion(uint32 relativeId)
 {
@@ -1340,10 +1379,11 @@ bool CJitter::CopyPropagation(StatementList& statements)
 
 bool CJitter::CommonExpressionElimination(VERSIONED_STATEMENT_LIST& versionedStatementList)
 {
+	//Earlier temporary definitions are bucketed by operation: only those can match, and the first match in
+	//definition order is the same as when scanning all of them.
 	bool changed = false;
-	std::vector<StatementList::const_iterator> tempDefs;
+	std::unordered_map<uint32, std::vector<StatementList::const_iterator>> tempDefs;
 	std::unordered_map<SymbolPtr, SymbolPtr> tempReplaceMap;
-	tempDefs.reserve(versionedStatementList.statements.size());
 
 	for(auto statementIterator(versionedStatementList.statements.begin());
 	    versionedStatementList.statements.end() != statementIterator; ++statementIterator)
@@ -1360,13 +1400,13 @@ bool CJitter::CommonExpressionElimination(VERSIONED_STATEMENT_LIST& versionedSta
 			const auto& newTemp = statement.dst->GetSymbol();
 
 			bool found = false;
+			auto& sameOpDefs = tempDefs[statement.op];
 			//Check if our temporary already has a similar definition
-			for(const auto& tempDef : tempDefs)
+			for(const auto& tempDef : sameOpDefs)
 			{
 				const auto& tempDefStatement = *tempDef;
 				assert(tempDefStatement.dst);
 				const auto& temp = tempDefStatement.dst;
-				if(statement.op != tempDefStatement.op) continue;
 				if(statement.jmpCondition != tempDefStatement.jmpCondition) continue;
 				if(statement.src1 && !statement.src1->Equals(tempDefStatement.src1.get())) continue;
 				if(statement.src2 && !statement.src2->Equals(tempDefStatement.src2.get())) continue;
@@ -1381,7 +1421,7 @@ bool CJitter::CommonExpressionElimination(VERSIONED_STATEMENT_LIST& versionedSta
 			//We haven't found a replacement for our definition, assume it's new
 			if(!found)
 			{
-				tempDefs.push_back(statementIterator);
+				sameOpDefs.push_back(statementIterator);
 			}
 		}
 
@@ -1504,16 +1544,20 @@ bool CJitter::MergeCmpSelectOps(StatementList& statements)
 
 bool CJitter::DeadcodeElimination(VERSIONED_STATEMENT_LIST& versionedStatementList)
 {
-	bool changed = false;
+	//A statement is dead if its destination (a temporary, or a relative that is written again later) is never
+	//read by a later statement: same symbol and version, or (relatives) another relative overlapping it in memory.
+	//One backward pass with the sets of symbols read so far, instead of rescanning the rest of the list per statement.
+	std::unordered_set<SYMBOL_KEY, SYMBOL_KEY_HASH> readRefs;
+	//Relative symbols read so far, ordered by start offset: (start, type, valueHigh)
+	std::set<std::tuple<uint32, uint32, uint32>> readRelatives;
+	std::vector<StatementList::iterator> toDelete;
 
-	typedef std::list<StatementList::iterator> ToDeleteList;
-	ToDeleteList toDelete;
-
-	for(auto outerStatementIterator(versionedStatementList.statements.begin());
-	    versionedStatementList.statements.end() != outerStatementIterator; ++outerStatementIterator)
+	auto& statements = versionedStatementList.statements;
+	for(auto statementIterator = statements.end(); statementIterator != statements.begin();)
 	{
-		auto& outerStatement(*outerStatementIterator);
-		const auto& symbolRef(outerStatement.dst);
+		--statementIterator;
+		auto& statement(*statementIterator);
+		const auto& symbolRef(statement.dst);
 
 		CSymbol* candidate = nullptr;
 		if(symbolRef && symbolRef->GetSymbol()->IsTemporary())
@@ -1529,62 +1573,80 @@ bool CJitter::DeadcodeElimination(VERSIONED_STATEMENT_LIST& versionedStatementLi
 			}
 		}
 
-		if(!candidate) continue;
-
-		//Look for any possible use of this symbol
-		bool used = false;
-		for(auto innerStatementIterator(outerStatementIterator);
-		    versionedStatementList.statements.end() != innerStatementIterator; ++innerStatementIterator)
+		if(candidate)
 		{
-			if(outerStatementIterator == innerStatementIterator) continue;
-
-			const auto& innerStatement(*innerStatementIterator);
-
-			innerStatement.VisitSources(
-			    [&](const SymbolRefPtr& innerSymbolRef, bool) {
-				    if(innerSymbolRef->Equals(symbolRef.get()))
-				    {
-					    used = true;
-					    return;
-				    }
-
-				    auto symbol(innerSymbolRef->GetSymbol());
-				    if(!symbol->Equals(candidate) && symbol->Aliases(candidate))
-				    {
-					    used = true;
-					    return;
-				    }
-			    });
-
-			if(used) break;
+			bool used = readRefs.count(MakeSymbolKey(candidate, symbolRef->GetVersion())) != 0;
+			if(!used && candidate->IsRelative())
+			{
+				//Any other relative symbol overlapping the candidate's memory (largest relative symbols are 16 bytes)
+				uint32 candidateStart = candidate->m_valueLow;
+				uint32 candidateEnd = candidateStart + candidate->GetSize();
+				uint32 searchStart = (candidateStart >= 16) ? (candidateStart - 16) : 0;
+				for(auto readIterator = readRelatives.lower_bound(std::make_tuple(searchStart, 0U, 0U));
+				    readIterator != readRelatives.end(); ++readIterator)
+				{
+					uint32 start = std::get<0>(*readIterator);
+					if(start >= candidateEnd) break;
+					CSymbol readSymbol(static_cast<SYM_TYPE>(std::get<1>(*readIterator)), start, std::get<2>(*readIterator));
+					if(!readSymbol.Equals(candidate) && readSymbol.Aliases(candidate))
+					{
+						used = true;
+						break;
+					}
+				}
+			}
+			if(!used)
+			{
+				toDelete.push_back(statementIterator);
+			}
 		}
 
-		if(!used)
-		{
-			//Kill it!
-			toDelete.push_back(outerStatementIterator);
-		}
+		statement.VisitSources(
+		    [&](const SymbolRefPtr& readSymbolRef, bool) {
+			    auto symbol = readSymbolRef->GetSymbol();
+			    readRefs.insert(MakeSymbolKey(symbol.get(), readSymbolRef->GetVersion()));
+			    if(symbol->IsRelative())
+			    {
+				    readRelatives.insert(std::make_tuple(symbol->m_valueLow, static_cast<uint32>(symbol->m_type), symbol->m_valueHigh));
+			    }
+		    });
 	}
 
-	for(ToDeleteList::const_iterator deleteIterator(toDelete.begin());
-	    toDelete.end() != deleteIterator; ++deleteIterator)
+	for(const auto& deleteIterator : toDelete)
 	{
-		versionedStatementList.statements.erase(*deleteIterator);
-		changed = true;
+		statements.erase(deleteIterator);
 	}
 
-	return changed;
+	return !toDelete.empty();
 }
 
 void CJitter::CoalesceTemporaries(BASIC_BLOCK& basicBlock)
 {
-	typedef std::vector<CSymbol*> EncounteredTempList;
-	EncounteredTempList encounteredTemps;
-
-	for(auto outerStatementIterator(basicBlock.statements.begin());
-	    basicBlock.statements.end() != outerStatementIterator; ++outerStatementIterator)
+	//Each temporary defined here takes over the first temporary seen before it (same type) that is not referenced
+	//by any later statement. The positions of the statements referencing each temporary are indexed, so checking
+	//whether a temporary is referenced later is a lookup instead of a scan of the rest of the block.
+	std::vector<StatementList::iterator> statements;
+	std::unordered_map<SYMBOL_KEY, std::vector<uint32>, SYMBOL_KEY_HASH> positions; //ascending, may repeat
+	for(auto statementIterator = basicBlock.statements.begin(); statementIterator != basicBlock.statements.end(); ++statementIterator)
 	{
-		auto& outerStatement(*outerStatementIterator);
+		uint32 position = static_cast<uint32>(statements.size());
+		statements.push_back(statementIterator);
+		statementIterator->VisitOperands(
+		    [&](const SymbolRefPtr& symbolRef, bool) {
+			    auto symbol = symbolRef->GetSymbol();
+			    if(symbol->IsTemporary()) positions[MakeSymbolKey(symbol.get())].push_back(position);
+		    });
+	}
+
+	auto isReferencedAfter = [&](const CSymbol* symbol, uint32 position) {
+		auto positionsIterator = positions.find(MakeSymbolKey(symbol));
+		return (positionsIterator != positions.end()) && !positionsIterator->second.empty() && (positionsIterator->second.back() > position);
+	};
+
+	std::vector<CSymbol*> encounteredTemps;
+	for(uint32 outerPosition = 0; outerPosition < statements.size(); outerPosition++)
+	{
+		auto& outerStatement(*statements[outerPosition]);
 
 		if(!outerStatement.dst) continue;
 		if(!outerStatement.dst->GetSymbol()->IsTemporary()) continue;
@@ -1596,29 +1658,7 @@ void CJitter::CoalesceTemporaries(BASIC_BLOCK& basicBlock)
 		for(auto* encounteredTemp : encounteredTemps)
 		{
 			if(encounteredTemp->m_type != tempSymbol->m_type) continue;
-
-			//Look for any possible use of this symbol
-			bool used = false;
-
-			for(auto innerStatementIterator(outerStatementIterator);
-			    basicBlock.statements.end() != innerStatementIterator; ++innerStatementIterator)
-			{
-				if(outerStatementIterator == innerStatementIterator) continue;
-
-				const auto& innerStatement(*innerStatementIterator);
-				innerStatement.VisitOperands(
-				    [&](const SymbolRefPtr& symbolRef, bool) {
-					    auto symbol = symbolRef->GetSymbol();
-					    if(symbol->Equals(encounteredTemp))
-					    {
-						    used = true;
-					    }
-				    });
-
-				if(used) break;
-			}
-
-			if(!used)
+			if(!isReferencedAfter(encounteredTemp, outerPosition))
 			{
 				candidate = encounteredTemp;
 				break;
@@ -1628,54 +1668,34 @@ void CJitter::CoalesceTemporaries(BASIC_BLOCK& basicBlock)
 		if(candidate == nullptr)
 		{
 			encounteredTemps.push_back(tempSymbol);
+			continue;
 		}
-		else
+
+		auto candidatePtr = MakeSymbol(candidate->m_type, candidate->m_valueLow);
+		outerStatement.dst = MakeSymbolRef(candidatePtr);
+
+		//Replace all occurences of this temp with the candidate
+		auto& tempPositions = positions[MakeSymbolKey(tempSymbol)];
+		auto firstLater = std::upper_bound(tempPositions.begin(), tempPositions.end(), outerPosition);
+		std::vector<uint32> movedPositions(firstLater, tempPositions.end());
+		movedPositions.erase(std::unique(movedPositions.begin(), movedPositions.end()), movedPositions.end());
+		for(auto position : movedPositions)
 		{
-			auto candidatePtr = MakeSymbol(candidate->m_type, candidate->m_valueLow);
-
-			outerStatement.dst = MakeSymbolRef(candidatePtr);
-
-			//Replace all occurences of this temp with the candidate
-			for(auto innerStatementIterator(outerStatementIterator);
-			    basicBlock.statements.end() != innerStatementIterator; ++innerStatementIterator)
+			auto& innerStatement(*statements[position]);
+			for(auto* operand : {&innerStatement.dst, &innerStatement.src1, &innerStatement.src2, &innerStatement.src3})
 			{
-				if(outerStatementIterator == innerStatementIterator) continue;
-
-				auto& innerStatement(*innerStatementIterator);
-
-				if(innerStatement.dst)
+				if(*operand && (*operand)->GetSymbol()->Equals(tempSymbol))
 				{
-					auto symbol(innerStatement.dst->GetSymbol());
-					if(symbol->Equals(tempSymbol))
-					{
-						innerStatement.dst = MakeSymbolRef(candidatePtr);
-					}
-				}
-				if(innerStatement.src1)
-				{
-					auto symbol(innerStatement.src1->GetSymbol());
-					if(symbol->Equals(tempSymbol))
-					{
-						innerStatement.src1 = MakeSymbolRef(candidatePtr);
-					}
-				}
-				if(innerStatement.src2)
-				{
-					auto symbol(innerStatement.src2->GetSymbol());
-					if(symbol->Equals(tempSymbol))
-					{
-						innerStatement.src2 = MakeSymbolRef(candidatePtr);
-					}
-				}
-				if(innerStatement.src3)
-				{
-					auto symbol(innerStatement.src3->GetSymbol());
-					if(symbol->Equals(tempSymbol))
-					{
-						innerStatement.src3 = MakeSymbolRef(candidatePtr);
-					}
+					*operand = MakeSymbolRef(candidatePtr);
 				}
 			}
+		}
+		if(!candidate->Equals(tempSymbol))
+		{
+			tempPositions.erase(firstLater, tempPositions.end());
+			//The candidate is not referenced after outerPosition, so appending keeps its list sorted
+			auto& candidatePositions = positions[MakeSymbolKey(candidate)];
+			candidatePositions.insert(candidatePositions.end(), movedPositions.begin(), movedPositions.end());
 		}
 	}
 }
