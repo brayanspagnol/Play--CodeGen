@@ -44,8 +44,7 @@ void CCodeGen_Wasm::PushRelativeFp32(CSymbol* symbol)
 	PushRelativeAddress(symbol);
 
 	m_functionStream.Write8(Wasm::INST_F32_LOAD);
-	m_functionStream.Write8(0x02);
-	m_functionStream.Write8(0x00);
+	WriteRelativeMemArg(0x02);
 }
 
 void CCodeGen_Wasm::PushTemporaryFp32(CSymbol* symbol)
@@ -199,8 +198,7 @@ void CCodeGen_Wasm::Emit_Fp_ToSingleI32_MemMem(const STATEMENT& statement)
 	{
 		PushRelativeAddress(src1);
 		m_functionStream.Write8(Wasm::INST_I32_LOAD);
-		m_functionStream.Write8(0x02);
-		m_functionStream.Write8(0x00);
+		WriteRelativeMemArg(0x02);
 	}
 
 	m_functionStream.Write8(Wasm::INST_F32_CONVERT_I32_S);
@@ -229,8 +227,7 @@ void CCodeGen_Wasm::Emit_Fp_ToInt32TruncS_MemMem(const STATEMENT& statement)
 	else
 	{
 		m_functionStream.Write8(Wasm::INST_I32_STORE);
-		m_functionStream.Write8(0x02);
-		m_functionStream.Write8(0x00);
+		WriteRelativeMemArg(0x02);
 	}
 }
 

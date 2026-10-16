@@ -285,6 +285,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	m_promotedLocations.clear();
 	m_promotedAccesses.clear();
 	m_promotedDirty.clear();
+	m_relativeOffsets.clear();
 
 	if(!m_structuredControlFlow)
 	{
@@ -332,6 +333,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	EmitPromotedStoreDirty();
 
 	m_functionStream.Write8(Wasm::INST_END);
+	if(!m_relativeOffsets.empty()) throw std::runtime_error("Relative address without its load/store");
 
 	CWasmModuleBuilder::FUNCTION function;
 	function.code = CWasmModuleBuilder::FunctionCode(m_functionStream.GetBuffer(), m_functionStream.GetBuffer() + m_functionStream.GetSize());
@@ -425,8 +427,7 @@ bool CCodeGen_Wasm::TryEmitStorePair64(const STATEMENT& first, const STATEMENT& 
 		m_functionStream.Write8(Wasm::INST_I64_CONST);
 		CWasmModuleBuilder::WriteSLeb128(m_functionStream, static_cast<int64>(value));
 		m_functionStream.Write8(Wasm::INST_I64_STORE);
-		m_functionStream.Write8(0x03);
-		m_functionStream.Write8(0x00);
+		WriteRelativeMemArg(0x03);
 		return true;
 	}
 
@@ -462,8 +463,7 @@ bool CCodeGen_Wasm::TryEmitStorePair64(const STATEMENT& first, const STATEMENT& 
 	PrepareSymbolUse(value);
 	m_functionStream.Write8(Wasm::INST_I64_EXTEND_I32_S);
 	m_functionStream.Write8(Wasm::INST_I64_STORE);
-	m_functionStream.Write8(0x03);
-	m_functionStream.Write8(0x00);
+	WriteRelativeMemArg(0x03);
 	return true;
 }
 
@@ -1382,12 +1382,18 @@ void CCodeGen_Wasm::PushRelativeAddress(CSymbol* symbol)
 	    (symbol->m_type == SYM_FP_RELATIVE32) ||
 	    (symbol->m_type == SYM_RELATIVE128));
 
+	//Only the context goes on the stack: the offset becomes the memarg offset of the load/store that uses
+	//the address (WriteRelativeMemArg), so engines don't see (and CSE) an add per context field
 	PushContext();
+	m_relativeOffsets.push_back(symbol->m_valueLow);
+}
 
-	m_functionStream.Write8(Wasm::INST_I32_CONST);
-	CWasmModuleBuilder::WriteSLeb128(m_functionStream, symbol->m_valueLow);
-
-	m_functionStream.Write8(Wasm::INST_I32_ADD);
+void CCodeGen_Wasm::WriteRelativeMemArg(uint8 alignment)
+{
+	if(m_relativeOffsets.empty()) throw std::runtime_error("WriteRelativeMemArg: no pending relative address");
+	m_functionStream.Write8(alignment);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, m_relativeOffsets.back());
+	m_relativeOffsets.pop_back();
 }
 
 void CCodeGen_Wasm::PushRelative(CSymbol* symbol)
@@ -1400,8 +1406,7 @@ void CCodeGen_Wasm::PushRelative(CSymbol* symbol)
 	PushRelativeAddress(symbol);
 
 	m_functionStream.Write8(Wasm::INST_I32_LOAD);
-	m_functionStream.Write8(0x02);
-	m_functionStream.Write8(0x00);
+	WriteRelativeMemArg(0x02);
 }
 
 void CCodeGen_Wasm::PushTemporary(CSymbol* symbol)
@@ -1427,11 +1432,7 @@ void CCodeGen_Wasm::PushRelativeRefAddress(CSymbol* symbol)
 	assert(symbol->m_type == SYM_REL_REFERENCE);
 
 	PushContext();
-
-	m_functionStream.Write8(Wasm::INST_I32_CONST);
-	CWasmModuleBuilder::WriteSLeb128(m_functionStream, symbol->m_valueLow);
-
-	m_functionStream.Write8(Wasm::INST_I32_ADD);
+	m_relativeOffsets.push_back(symbol->m_valueLow);
 }
 
 void CCodeGen_Wasm::PushRelativeRef(CSymbol* symbol)
@@ -1439,8 +1440,7 @@ void CCodeGen_Wasm::PushRelativeRef(CSymbol* symbol)
 	PushRelativeRefAddress(symbol);
 
 	m_functionStream.Write8(Wasm::INST_I32_LOAD);
-	m_functionStream.Write8(0x02);
-	m_functionStream.Write8(0x00);
+	WriteRelativeMemArg(0x02);
 }
 
 void CCodeGen_Wasm::PushTemporaryRef(CSymbol* symbol)
@@ -1545,8 +1545,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
 	{
 	case SYM_RELATIVE:
 		m_functionStream.Write8(Wasm::INST_I32_STORE);
-		m_functionStream.Write8(0x02);
-		m_functionStream.Write8(0x00);
+		WriteRelativeMemArg(0x02);
 		break;
 	case SYM_TEMPORARY:
 		PullTemporary(symbol);
@@ -1556,16 +1555,14 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
 		break;
 	case SYM_RELATIVE64:
 		m_functionStream.Write8(Wasm::INST_I64_STORE);
-		m_functionStream.Write8(0x03);
-		m_functionStream.Write8(0x00);
+		WriteRelativeMemArg(0x03);
 		break;
 	case SYM_TEMPORARY64:
 		PullTemporary64(symbol);
 		break;
 	case SYM_FP_RELATIVE32:
 		m_functionStream.Write8(Wasm::INST_F32_STORE);
-		m_functionStream.Write8(0x02);
-		m_functionStream.Write8(0x00);
+		WriteRelativeMemArg(0x02);
 		break;
 	case SYM_FP_TEMPORARY32:
 		PullTemporaryFp32(symbol);
@@ -1573,8 +1570,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
 	case SYM_RELATIVE128:
 		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
 		m_functionStream.Write8(Wasm::INST_V128_STORE);
-		m_functionStream.Write8(0x04);
-		m_functionStream.Write8(0x00);
+		WriteRelativeMemArg(0x04);
 		break;
 	case SYM_TEMPORARY128:
 		PullTemporary128(symbol);
