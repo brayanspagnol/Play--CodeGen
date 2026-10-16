@@ -206,7 +206,7 @@ EM_JS(int, RegisterExternFunction, (const char* functionName, const char* functi
 
 std::map<uintptr_t, CWasmFunctionRegistry::WASM_FUNCTION_INFO> CWasmFunctionRegistry::m_functions;
 
-void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char* functionName, const char* functionSig)
+void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char* functionName, const char* functionSig, FUNCTION_EFFECT effect)
 {
 	{
 		auto fctIterator = m_functions.find(functionPtr);
@@ -215,6 +215,7 @@ void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char* 
 	WASM_FUNCTION_INFO functionInfo;
 	functionInfo.id = RegisterExternFunction(functionName, functionSig, functionPtr);
 	functionInfo.signature = functionSig;
+	functionInfo.effect = effect;
 	m_functions.insert(std::make_pair(functionPtr, functionInfo));
 }
 
@@ -227,7 +228,7 @@ const CWasmFunctionRegistry::WASM_FUNCTION_INFO* CWasmFunctionRegistry::FindFunc
 
 #else
 
-void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char* functionName, const char* functionSig)
+void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char* functionName, const char* functionSig, FUNCTION_EFFECT effect)
 {
 }
 
@@ -484,6 +485,25 @@ void CCodeGen_Wasm::EmitPageEntry(const STATEMENT& statement)
 	CWasmModuleBuilder::WriteULeb128(m_functionStream, m_pageEntryLocal);
 }
 
+uintptr_t CCodeGen_Wasm::GetPageAccessHandler(const STATEMENT& statement) const
+{
+	const auto& h = m_pageAccessHandlers;
+	uint32 size = static_cast<uint32>(statement.jmpCondition);
+	//Quadwords go through four 32-bit calls
+	if(statement.op == OP_LOADFROMPAGE)
+	{
+		return (size == 1) ? h.load8 : (size == 2) ? h.load16 : (size == 8) ? h.load64 : h.load32;
+	}
+	assert(statement.op == OP_STOREATPAGE);
+	return (size == 1) ? h.store8 : (size == 2) ? h.store16 : (size == 8) ? h.store64 : h.store32;
+}
+
+bool CCodeGen_Wasm::IsEffectFree(uintptr_t function)
+{
+	auto fctInfo = CWasmFunctionRegistry::FindFunction(function);
+	return fctInfo && (fctInfo->effect == CWasmFunctionRegistry::FUNCTION_EFFECT_NONE);
+}
+
 //Operands (context, ...) already pushed
 void CCodeGen_Wasm::EmitHandlerCall(uintptr_t handler)
 {
@@ -548,7 +568,9 @@ void CCodeGen_Wasm::Emit_LoadFromPage(const STATEMENT& statement)
 	m_functionStream.Write8(Wasm::INST_ELSE);
 	{
 		//The handler gets the context: it must see our values and we must see its changes
-		EmitPromotedStoreDirty();
+		//(not needed for a FUNCTION_EFFECT_NONE handler, see PreparePromotion)
+		bool spill = !IsEffectFree(GetPageAccessHandler(statement));
+		if(spill) EmitPromotedStoreDirty();
 		if(size == 16)
 		{
 			//Four words (no 128-bit returns), quadword aligned
@@ -579,9 +601,9 @@ void CCodeGen_Wasm::Emit_LoadFromPage(const STATEMENT& statement)
 		{
 			PushContext();
 			EmitLocalGet(m_pageAddressLocal);
-			EmitHandlerCall((size == 1) ? h.load8 : (size == 2) ? h.load16 : (size == 8) ? h.load64 : h.load32);
+			EmitHandlerCall(GetPageAccessHandler(statement));
 		}
-		EmitPromotedLoadAll();
+		if(spill) EmitPromotedLoadAll();
 	}
 	m_functionStream.Write8(Wasm::INST_END);
 	CommitSymbol(dst);
@@ -635,7 +657,8 @@ void CCodeGen_Wasm::Emit_StoreAtPage(const STATEMENT& statement)
 	}
 	m_functionStream.Write8(Wasm::INST_ELSE);
 	{
-		EmitPromotedStoreDirty();
+		bool spill = !IsEffectFree(GetPageAccessHandler(statement));
+		if(spill) EmitPromotedStoreDirty();
 		if(size == 16)
 		{
 			for(uint32 i = 0; i < 4; i++)
@@ -660,9 +683,9 @@ void CCodeGen_Wasm::Emit_StoreAtPage(const STATEMENT& statement)
 			PushContext();
 			PrepareSymbolUse(value);
 			EmitLocalGet(m_pageAddressLocal);
-			EmitHandlerCall((size == 1) ? h.store8 : (size == 2) ? h.store16 : (size == 8) ? h.store64 : h.store32);
+			EmitHandlerCall(GetPageAccessHandler(statement));
 		}
-		EmitPromotedLoadAll();
+		if(spill) EmitPromotedLoadAll();
 	}
 	m_functionStream.Write8(Wasm::INST_END);
 }
@@ -872,12 +895,7 @@ void CCodeGen_Wasm::PrepareSignatures(CWasmModuleBuilder& moduleBuilder, const S
 	{
 		if((statement.op == OP_LOADFROMPAGE) || (statement.op == OP_STOREATPAGE))
 		{
-			bool isLoad = (statement.op == OP_LOADFROMPAGE);
-			uint32 size = static_cast<uint32>(statement.jmpCondition);
-			const auto& h = m_pageAccessHandlers;
-			uintptr_t handler = isLoad ? ((size == 1) ? h.load8 : (size == 2) ? h.load16 : (size == 8) ? h.load64 : h.load32)
-			                           : ((size == 1) ? h.store8 : (size == 2) ? h.store16 : (size == 8) ? h.store64 : h.store32);
-			auto fctInfo = CWasmFunctionRegistry::FindFunction(handler);
+			auto fctInfo = CWasmFunctionRegistry::FindFunction(GetPageAccessHandler(statement));
 			assert(fctInfo);
 			if(m_signatures.find(fctInfo->signature) == std::end(m_signatures))
 			{
@@ -1502,7 +1520,9 @@ void CCodeGen_Wasm::Emit_Call(const STATEMENT& statement)
 	assert(src2->m_type == SYM_CONSTANT);
 
 	//The callee gets the context: it must see our values and we must see its changes
-	EmitPromotedStoreDirty();
+	//(not needed for a FUNCTION_EFFECT_NONE callee, see PreparePromotion)
+	bool spill = !IsEffectFree(src1->m_valueLow);
+	if(spill) EmitPromotedStoreDirty();
 
 	unsigned int paramCount = src2->m_valueLow;
 	for(unsigned int i = 0; i < paramCount; i++)
@@ -1524,7 +1544,7 @@ void CCodeGen_Wasm::Emit_Call(const STATEMENT& statement)
 	m_functionStream.Write8(sigIdx); //Signature index
 	m_functionStream.Write8(0x00);   //Table index
 
-	EmitPromotedLoadAll();
+	if(spill) EmitPromotedLoadAll();
 }
 
 void CCodeGen_Wasm::Emit_RetVal_Tmp(const STATEMENT& statement)
@@ -1827,6 +1847,7 @@ void CCodeGen_Wasm::Emit_ExtHigh64VarMem64(const STATEMENT& statement)
 }
 
 std::vector<std::pair<uint32, uint32>> CCodeGen_Wasm::m_contextArrays;
+std::vector<std::pair<uint32, uint32>> CCodeGen_Wasm::m_volatileContextRanges;
 
 void CCodeGen_Wasm::SetContextPromotion(bool enabled)
 {
@@ -1843,6 +1864,11 @@ void CCodeGen_Wasm::RegisterContextArray(uint32 offset, uint32 size)
 	m_contextArrays.push_back(std::make_pair(offset, size));
 }
 
+void CCodeGen_Wasm::RegisterVolatileContextRange(uint32 offset, uint32 size)
+{
+	m_volatileContextRanges.push_back(std::make_pair(offset, size));
+}
+
 void CCodeGen_Wasm::PreparePromotion(const StatementList& statements)
 {
 	struct ACCESS
@@ -1854,9 +1880,20 @@ void CCodeGen_Wasm::PreparePromotion(const StatementList& statements)
 	std::set<PromotedKey> excluded;
 	std::set<PromotedKey> written;
 	std::vector<std::pair<uint32, uint32>> usedArrays;
+	//Calls to FUNCTION_EFFECT_NONE helpers skip the store/reload of promoted symbols, so the context ranges
+	//such helpers may touch stay in memory
+	bool callsEffectFree = false;
 
 	for(const auto& statement : statements)
 	{
+		if((statement.op == OP_LOADFROMPAGE) || (statement.op == OP_STOREATPAGE))
+		{
+			callsEffectFree |= IsEffectFree(GetPageAccessHandler(statement));
+		}
+		else if(statement.op == OP_CALL)
+		{
+			callsEffectFree |= IsEffectFree(statement.src1->GetSymbol()->m_valueLow);
+		}
 		if(statement.op == OP_RELTOREF)
 		{
 			uint32 offset = statement.src1->GetSymbol()->m_valueLow;
@@ -1971,6 +2008,18 @@ void CCodeGen_Wasm::PreparePromotion(const StatementList& statements)
 			{
 				promotable = false;
 				break;
+			}
+		}
+		if(!promotable) continue;
+		if(callsEffectFree)
+		{
+			for(const auto& volatileRange : m_volatileContextRanges)
+			{
+				if((range.start < volatileRange.first + volatileRange.second) && (volatileRange.first < range.end))
+				{
+					promotable = false;
+					break;
+				}
 			}
 		}
 		if(!promotable) continue;

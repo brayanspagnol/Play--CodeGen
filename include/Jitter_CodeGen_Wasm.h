@@ -14,13 +14,23 @@ namespace Jitter
 	class CWasmFunctionRegistry
 	{
 	public:
+		//What a helper may do to the context it is given (see context promotion in CCodeGen_Wasm)
+		enum FUNCTION_EFFECT
+		{
+			//Anything: promoted symbols are stored before the call and reloaded after it
+			FUNCTION_EFFECT_ALL,
+			//Only the ranges registered with CCodeGen_Wasm::RegisterVolatileContextRange
+			FUNCTION_EFFECT_NONE,
+		};
+
 		struct WASM_FUNCTION_INFO
 		{
 			int32 id = 0;
 			std::string signature;
+			FUNCTION_EFFECT effect = FUNCTION_EFFECT_ALL;
 		};
 
-		static void RegisterFunction(uintptr_t, const char*, const char*);
+		static void RegisterFunction(uintptr_t, const char*, const char*, FUNCTION_EFFECT = FUNCTION_EFFECT_ALL);
 		static const WASM_FUNCTION_INFO* FindFunction(uintptr_t);
 
 	private:
@@ -51,6 +61,10 @@ namespace Jitter
 		//a reference to an unregistered part of the context is not promoted.
 		void SetContextPromotion(bool);
 		static void RegisterContextArray(uint32 offset, uint32 size);
+		//Context ranges that FUNCTION_EFFECT_NONE helpers may still read or write (program counter, exception
+		//flags, ...). A function that calls such a helper keeps these ranges in memory, so its calls to
+		//FUNCTION_EFFECT_NONE helpers (memory access slow paths) need no store or reload of promoted symbols.
+		static void RegisterVolatileContextRange(uint32 offset, uint32 size);
 		//Name for the next generated function (profiling); empty: no name section
 		void SetFunctionName(std::string);
 
@@ -111,6 +125,8 @@ namespace Jitter
 		void Emit_StoreAtPage(const STATEMENT&);
 		void EmitPageEntry(const STATEMENT&);
 		void EmitHandlerCall(uintptr_t);
+		uintptr_t GetPageAccessHandler(const STATEMENT&) const;
+		static bool IsEffectFree(uintptr_t);
 		uint32 m_pageAddressLocal = 0;
 		uint32 m_pageEntryLocal = 0;
 	public:
@@ -330,5 +346,6 @@ namespace Jitter
 		uint32 m_scratchI64Local = 0;
 		uint32 m_scratchF32Local = 0;
 		static std::vector<std::pair<uint32, uint32>> m_contextArrays;
+		static std::vector<std::pair<uint32, uint32>> m_volatileContextRanges;
 	};
 }
