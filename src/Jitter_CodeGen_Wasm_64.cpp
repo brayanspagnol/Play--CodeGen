@@ -49,8 +49,7 @@ void CCodeGen_Wasm::PushRelative64(CSymbol* symbol)
 	PushRelativeAddress(symbol);
 
 	m_functionStream.Write8(Wasm::INST_I64_LOAD);
-	m_functionStream.Write8(0x03);
-	m_functionStream.Write8(0x00);
+	WriteRelativeMemArg(0x03);
 }
 
 void CCodeGen_Wasm::PushTemporary64(CSymbol* symbol)

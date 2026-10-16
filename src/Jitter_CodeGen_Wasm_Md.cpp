@@ -108,8 +108,7 @@ void CCodeGen_Wasm::PushRelative128(CSymbol* symbol)
 
 	m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
 	m_functionStream.Write8(Wasm::INST_V128_LOAD);
-	m_functionStream.Write8(0x04);
-	m_functionStream.Write8(0x00);
+	WriteRelativeMemArg(0x04);
 }
 
 void CCodeGen_Wasm::PushTemporary128(CSymbol* symbol)

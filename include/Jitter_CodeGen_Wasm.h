@@ -152,6 +152,7 @@ namespace Jitter
 		void PushContext();
 
 		void PushRelativeAddress(CSymbol*);
+		void WriteRelativeMemArg(uint8);
 		void PushRelative(CSymbol*);
 
 		void PushTemporary(CSymbol*);
@@ -327,6 +328,7 @@ namespace Jitter
 		std::map<PromotedKey, PROMOTED_ACCESS> m_promotedAccesses;
 		std::set<PromotedKey> m_promotedDirty;
 		uint32 m_scratchI32Local = 0;
+		std::vector<uint32> m_relativeOffsets; //Context offsets of pushed relative addresses, used by their load/store memarg
 		uint32 m_scratchI64Local = 0;
 		uint32 m_scratchF32Local = 0;
 		static std::vector<std::pair<uint32, uint32>> m_contextArrays;
