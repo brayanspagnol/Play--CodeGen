@@ -136,7 +136,7 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
 
 	{ OP_CMP,            MATCH_ANY,            MATCH_ANY,            MATCH_ANY,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Cmp_AnyAnyAny                          },
 
-	{ OP_SELECT,         MATCH_VARIABLE,       MATCH_VARIABLE,       MATCH_ANY,           MATCH_ANY,      &CCodeGen_Wasm::Emit_Select_VarVarAnyAny                    },
+	{ OP_SELECT,         MATCH_VARIABLE,       MATCH_ANY32,          MATCH_ANY,           MATCH_ANY,      &CCodeGen_Wasm::Emit_Select_VarVarAnyAny                    },
 
 	{ OP_SLL,            MATCH_ANY,            MATCH_ANY,            MATCH_ANY,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Generic_Binary_MemAnyAny<Wasm::INST_I32_SHL>   },
 	{ OP_SRL,            MATCH_ANY,            MATCH_ANY,            MATCH_ANY,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Generic_Binary_MemAnyAny<Wasm::INST_I32_SHR_U> },

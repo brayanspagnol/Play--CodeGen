@@ -45,6 +45,7 @@
 #include <pthread.h>
 #elif defined(MEMFUNC_USE_WASM)
 EM_JS_DEPS(WasmMemoryFunction, "$addFunction,$removeFunction");
+EM_JS_DEPS(WasmMemoryFunctionBatch, "$getEmptyTableSlot,$setWasmTableEntry");
 EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle),
 {
 	let module = Emval.toValue(moduleHandle);
@@ -73,7 +74,11 @@ EM_JS(int, WasmCreateBatch, (uintptr_t code, uintptr_t size, int count, int* fct
 		});
 		for(let i = 0; i < count; i++)
 		{
-			HEAP32[(fctIds >> 2) + i] = addFunction(instance.exports["f" + i], 'vi');
+			//Own slot per export, even when several exports are the same function (EE regions):
+			//every slot is removed by its owner (addFunction would hand out one shared slot)
+			let fctId = getEmptyTableSlot();
+			setWasmTableEntry(fctId, instance.exports["f" + i]);
+			HEAP32[(fctIds >> 2) + i] = fctId;
 		}
 		return 1;
 	}
