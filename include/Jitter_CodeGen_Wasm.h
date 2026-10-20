@@ -72,6 +72,8 @@ namespace Jitter
 		//Off: only the if/else and single loop patterns of BuildLabelFlows are supported.
 		//Irreducible graphs throw (callers must only build reducible ones).
 		void SetStructuredControlFlow(bool);
+		//Emit a branch hint section ("metadata.code.branch_hint") marking memory access fast paths as likely
+		static void SetBranchHints(bool);
 		bool GetStructuredControlFlow() const
 		{
 			return m_structuredControlFlow;
@@ -354,6 +356,8 @@ namespace Jitter
 		bool m_structuredControlFlow = false;
 		bool m_usesBlockTable = false;
 		std::string m_functionName;
+		std::vector<std::pair<uint32, uint8>> m_branchHintOffsets; //Function stream offsets of hinted 'if's, 1: then branch likely, 0: unlikely
+		static bool m_branchHints;
 		std::map<PromotedKey, uint32> m_promotedLocations; //Container -> group-relative local index
 		std::map<PromotedKey, PROMOTED_ACCESS> m_promotedAccesses;
 		std::set<PromotedKey> m_promotedDirty;

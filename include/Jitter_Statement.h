@@ -221,6 +221,7 @@ namespace Jitter
 		SymbolRefPtr dst;
 		uint32 jmpBlock;
 		CONDITION jmpCondition;
+		int8 branchHint = 0; //OP_CONDJMP from BeginIf: 1 the if body is likely, -1 unlikely
 
 		template <typename F>
 		void VisitOperands(const F& visitor)

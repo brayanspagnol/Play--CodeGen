@@ -80,7 +80,7 @@ void CJitter::Goto(LABEL label)
 	InsertStatement(statement);
 }
 
-void CJitter::BeginIf(CONDITION condition)
+void CJitter::BeginIf(CONDITION condition, int branchHint)
 {
 	uint32 jumpBlockId = m_nextBlockId++;
 	m_ifStack.push(jumpBlockId);
@@ -91,6 +91,7 @@ void CJitter::BeginIf(CONDITION condition)
 	statement.src1 = MakeSymbolRef(m_shadow.Pull());
 	statement.jmpCondition = NegateCondition(condition);
 	statement.jmpBlock = jumpBlockId;
+	statement.branchHint = static_cast<int8>(branchHint);
 	InsertStatement(statement);
 
 	assert(m_shadow.GetCount() == 0);

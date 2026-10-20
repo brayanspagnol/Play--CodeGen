@@ -286,6 +286,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	m_promotedAccesses.clear();
 	m_promotedDirty.clear();
 	m_relativeOffsets.clear();
+	m_branchHintOffsets.clear();
 
 	if(!m_structuredControlFlow)
 	{
@@ -342,6 +343,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	function.localF32Count = m_localF32Count;
 	function.localV128Count = m_localV128Count;
 	function.name = std::move(m_functionName);
+	if(m_branchHints) function.branchHints = m_branchHintOffsets;
 	m_functionName.clear();
 
 	moduleBuilder.SetImportsBlockTable(m_usesBlockTable);
@@ -450,6 +452,26 @@ bool CCodeGen_Wasm::TryEmitStorePair64(const STATEMENT& first, const STATEMENT& 
 		CWasmModuleBuilder::WriteSLeb128(m_functionStream, static_cast<int64>(value));
 		commitPair(lo->dst->GetSymbol().get());
 		return true;
+	}
+
+	//hi = 0 and lo = x (zero extension), any order
+	if((first.op == OP_MOV) && (second.op == OP_MOV) && (isConstant(first.src1) != isConstant(second.src1)))
+	{
+		const STATEMENT* zero = isConstant(first.src1) ? &first : &second;
+		const STATEMENT* mov = isConstant(first.src1) ? &second : &first;
+		auto loDst = mov->dst->GetSymbol().get();
+		auto hiDst = zero->dst->GetSymbol().get();
+		auto value = mov->src1->GetSymbol().get();
+		if((zero->src1->GetSymbol()->m_valueLow == 0) && (hiDst->m_valueLow == loDst->m_valueLow + 4) &&
+		   ((value->m_type == SYM_TEMPORARY) || (value->m_type == SYM_RELATIVE)) &&
+		   !((zero == &first) && value->Equals(hiDst)))
+		{
+			if(!promotedPair) PushRelativeAddress(loDst);
+			PrepareSymbolUse(value);
+			m_functionStream.Write8(Wasm::INST_I64_EXTEND_I32_U);
+			commitPair(loDst);
+			return true;
+		}
 	}
 
 	//hi = x >> 31 (arithmetic) and lo = x, any order
@@ -562,6 +584,7 @@ void CCodeGen_Wasm::Emit_LoadFromPage(const STATEMENT& statement)
 
 	PrepareSymbolDef(dst);
 	EmitPageEntry(statement);
+	m_branchHintOffsets.push_back({static_cast<uint32>(m_functionStream.GetSize()), static_cast<uint8>(1)});
 	m_functionStream.Write8(Wasm::INST_IF);
 	m_functionStream.Write8((size == 16) ? Wasm::TYPE_V128 : (size == 8) ? Wasm::TYPE_I64 : Wasm::TYPE_I32);
 	{
@@ -651,6 +674,7 @@ void CCodeGen_Wasm::Emit_StoreAtPage(const STATEMENT& statement)
 	const auto& h = m_pageAccessHandlers;
 
 	EmitPageEntry(statement);
+	m_branchHintOffsets.push_back({static_cast<uint32>(m_functionStream.GetSize()), static_cast<uint8>(1)});
 	m_functionStream.Write8(Wasm::INST_IF);
 	m_functionStream.Write8(Wasm::BLOCK_TYPE_VOID);
 	{
@@ -1179,6 +1203,11 @@ void CCodeGen_Wasm::EmitStructured(const StatementList& statements)
 		{
 			//The OP_CONDJMP emitter leaves the "don't jump" condition on the stack
 			EmitStatementRange(node.end, std::next(node.end));
+			if(node.end->branchHint != 0)
+			{
+				//The 'if' body is the fall through (the BeginIf body)
+				m_branchHintOffsets.push_back({static_cast<uint32>(m_functionStream.GetSize()), static_cast<uint8>((node.end->branchHint > 0) ? 1 : 0)});
+			}
 			openScope(Wasm::INST_IF, CONTEXT_IF, -1);
 			doBranch(x, node.succ[0]);
 			m_functionStream.Write8(Wasm::INST_ELSE);
@@ -2174,6 +2203,13 @@ void CCodeGen_Wasm::SetStructuredControlFlow(bool enabled)
 	m_structuredControlFlow = enabled;
 }
 
+bool CCodeGen_Wasm::m_branchHints = false;
+
+void CCodeGen_Wasm::SetBranchHints(bool enabled)
+{
+	m_branchHints = enabled;
+}
+
 void CCodeGen_Wasm::SetFunctionName(std::string name)
 {
 	m_functionName = std::move(name);
@@ -2250,8 +2286,32 @@ void CCodeGen_Wasm::PreparePromotion(const StatementList& statements)
 		}
 		return false;
 	};
-	//8-byte slots accessed as a 64-bit value, or as both 32-bit halves (MIPS GPRs: 32-bit operations write
-	//a sign-extended 64-bit result as two halves, 64-bit compares read it whole) get one i64 container
+	//8-byte slots accessed as a 64-bit value, or whose halves are written by consecutive statements (MIPS GPRs:
+	//32-bit operations write a sign-extended 64-bit result as two halves, 64-bit compares read it whole) get
+	//one i64 container. Slots that overlap a volatile range keep separate containers.
+	std::set<uint32> pairedSlots;
+	for(auto statementIterator = statements.begin(); statementIterator != statements.end(); statementIterator++)
+	{
+		auto nextIterator = std::next(statementIterator);
+		if(nextIterator == statements.end()) break;
+		const auto& first = statementIterator->dst;
+		const auto& second = nextIterator->dst;
+		if(!first || !second) continue;
+		auto firstSymbol = first->GetSymbol();
+		auto secondSymbol = second->GetSymbol();
+		if((firstSymbol->m_type != SYM_RELATIVE) || (secondSymbol->m_type != SYM_RELATIVE)) continue;
+		uint32 lo = std::min(firstSymbol->m_valueLow, secondSymbol->m_valueLow);
+		uint32 hi = std::max(firstSymbol->m_valueLow, secondSymbol->m_valueLow);
+		if(((lo & 7) == 0) && (hi == lo + 4)) pairedSlots.insert(lo);
+	}
+	auto overlapsVolatile = [&](uint32 start, uint32 end) {
+		if(!callsEffectFree) return false;
+		for(const auto& volatileRange : m_volatileContextRanges)
+		{
+			if((start < volatileRange.first + volatileRange.second) && (volatileRange.first < end)) return true;
+		}
+		return false;
+	};
 	std::set<uint32> i64Slots;
 	{
 		std::map<uint32, uint32> slotUses; //bit 0: low half, bit 1: high half, bit 2: whole
@@ -2273,7 +2333,8 @@ void CCodeGen_Wasm::PreparePromotion(const StatementList& statements)
 		for(const auto& slotPair : slotUses)
 		{
 			if(slotPair.second & 8) continue;
-			if((slotPair.second & 4) || (slotPair.second == 3)) i64Slots.insert(slotPair.first);
+			if(overlapsVolatile(slotPair.first, slotPair.first + 8)) continue;
+			if((slotPair.second & 4) || ((slotPair.second == 3) && pairedSlots.count(slotPair.first))) i64Slots.insert(slotPair.first);
 		}
 	}
 	std::map<PromotedKey, ACCESS> containers;

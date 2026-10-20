@@ -51,7 +51,7 @@ namespace Jitter
 
 		bool IsStackEmpty() const;
 
-		void BeginIf(CONDITION);
+		void BeginIf(CONDITION, int branchHint = 0);
 		void Else();
 		void EndIf();
 
