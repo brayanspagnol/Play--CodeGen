@@ -44,7 +44,7 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #elif defined(MEMFUNC_USE_WASM)
-EM_JS_DEPS(WasmMemoryFunction, "$addFunction,$removeFunction");
+EM_JS_DEPS(WasmMemoryFunction, "$addFunction,$removeFunction,$getEmptyTableSlot,$getWasmTableEntry,$setWasmTableEntry");
 EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle),
 {
 	let module = Emval.toValue(moduleHandle);
@@ -82,6 +82,13 @@ EM_JS(int, WasmCreateBatch, (uintptr_t code, uintptr_t size, int count, int* fct
 		err("JIT batch module failed: " + e);
 		return 0;
 	}
+});
+//New table slot calling the same function (addFunction would return the existing slot)
+EM_JS(int, WasmCloneFunction, (int fctId),
+{
+	let index = getEmptyTableSlot();
+	setWasmTableEntry(index, getWasmTableEntry(fctId));
+	return index;
 });
 EM_JS(void, WasmDeleteFunction, (int fctId),
 {
@@ -271,6 +278,9 @@ void CMemoryFunction::ReplaceWasmFunction(int fctId)
 	assert(m_code != nullptr);
 	WasmDeleteFunction(reinterpret_cast<int>(m_code));
 	m_code = reinterpret_cast<void*>(fctId);
+	//Drop the single-function module so it can be collected: engines may keep a minimum amount of
+	//code memory per module (64 KiB in Firefox, which allows only ~16k live modules per process)
+	m_wasmModule = emscripten::val();
 }
 #endif
 
@@ -278,8 +288,14 @@ CMemoryFunction CMemoryFunction::CreateInstance()
 {
 #if defined(MEMFUNC_USE_WASM)
 	CMemoryFunction result;
-	result.m_wasmModule = m_wasmModule;
 	result.m_size = m_size;
+	if(m_wasmModule.isUndefined())
+	{
+		//Function from a batch module (see ReplaceWasmFunction): share it through a new table slot
+		result.m_code = reinterpret_cast<void*>(WasmCloneFunction(reinterpret_cast<int>(m_code)));
+		return result;
+	}
+	result.m_wasmModule = m_wasmModule;
 	result.m_code = reinterpret_cast<void*>(WasmCreateFunction(m_wasmModule.as_handle()));
 	return result;
 #else
