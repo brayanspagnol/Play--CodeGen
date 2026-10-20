@@ -71,6 +71,7 @@ add_library(CodeGen
 	src/Jitter_CodeGen.cpp
 	src/Jitter_CodeGenFactory.cpp
 	src/Jitter.cpp
+	src/Jitter_Interpreter.cpp
 	src/Jitter_Optimize.cpp
 	src/Jitter_RegAlloc.cpp
 	src/Jitter_Statement.cpp
@@ -104,6 +105,7 @@ add_library(CodeGen
 	include/Jitter_SymbolRef.h
 	include/Jitter_SymbolTable.h
 	include/Jitter.h
+	include/Jitter_Interpreter.h
 	include/Literal128.h
 	include/LiteralPool.h
 	include/MachoDefs.h

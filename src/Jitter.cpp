@@ -37,6 +37,16 @@ void CJitter::Begin()
 	StartBlock(m_nextBlockId++);
 }
 
+void CJitter::Abandon()
+{
+	m_blockStarted = false;
+	m_basicBlocks.clear();
+	m_labels.clear();
+	m_currentBlock = nullptr;
+	while(m_shadow.GetCount() != 0) m_shadow.Pull();
+	while(!m_ifStack.empty()) m_ifStack.pop();
+}
+
 void CJitter::End()
 {
 	assert(m_shadow.GetCount() == 0);

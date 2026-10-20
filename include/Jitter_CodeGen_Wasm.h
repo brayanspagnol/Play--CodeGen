@@ -129,6 +129,7 @@ namespace Jitter
 			uint32 pageShift = 12;
 		};
 		static void SetPageAccessHandlers(const PAGE_ACCESS_HANDLERS&);
+		static const PAGE_ACCESS_HANDLERS& GetPageAccessHandlers();
 		bool SupportsPageAccess() const override;
 
 		static uint32 GetCanonicalSignatureIndex(const std::string&);

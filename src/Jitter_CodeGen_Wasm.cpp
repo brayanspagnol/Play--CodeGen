@@ -458,6 +458,11 @@ void CCodeGen_Wasm::SetPageAccessHandlers(const PAGE_ACCESS_HANDLERS& handlers)
 	m_pageAccessHandlers = handlers;
 }
 
+const CCodeGen_Wasm::PAGE_ACCESS_HANDLERS& CCodeGen_Wasm::GetPageAccessHandlers()
+{
+	return m_pageAccessHandlers;
+}
+
 bool CCodeGen_Wasm::SupportsPageAccess() const
 {
 	return m_pageAccessHandlers.load32 != 0;
