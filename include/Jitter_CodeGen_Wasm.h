@@ -122,6 +122,8 @@ namespace Jitter
 			PROMOTED_WHOLE,     //Access is the whole container local
 			PROMOTED_LANE,      //Access is a lane of a v128 container
 			PROMOTED_BITCAST,   //f32 access to an i32 container
+			PROMOTED_LO32,      //Low half of an i64 container
+			PROMOTED_HI32,      //High half of an i64 container
 		};
 		struct PROMOTED_ACCESS
 		{
