@@ -285,6 +285,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	m_promotedAccesses.clear();
 	m_promotedDirty.clear();
 	m_relativeOffsets.clear();
+	m_branchHintOffsets.clear();
 
 	BuildLabelFlows(statements);
 	PrepareSignatures(moduleBuilder, statements);
@@ -360,6 +361,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	function.localF32Count = m_localF32Count;
 	function.localV128Count = m_localV128Count;
 	function.name = std::move(m_functionName);
+	if(m_branchHints) function.branchHints = m_branchHintOffsets;
 	m_functionName.clear();
 
 	moduleBuilder.SetImportsBlockTable(m_usesBlockTable);
@@ -512,6 +514,7 @@ void CCodeGen_Wasm::Emit_LoadFromPage(const STATEMENT& statement)
 
 	PrepareSymbolDef(dst);
 	EmitPageEntry(statement);
+	m_branchHintOffsets.push_back({static_cast<uint32>(m_functionStream.GetSize()), static_cast<uint8>(1)});
 	m_functionStream.Write8(Wasm::INST_IF);
 	m_functionStream.Write8((size == 16) ? Wasm::TYPE_V128 : (size == 8) ? Wasm::TYPE_I64 : Wasm::TYPE_I32);
 	{
@@ -599,6 +602,7 @@ void CCodeGen_Wasm::Emit_StoreAtPage(const STATEMENT& statement)
 	const auto& h = m_pageAccessHandlers;
 
 	EmitPageEntry(statement);
+	m_branchHintOffsets.push_back({static_cast<uint32>(m_functionStream.GetSize()), static_cast<uint8>(1)});
 	m_functionStream.Write8(Wasm::INST_IF);
 	m_functionStream.Write8(Wasm::BLOCK_TYPE_VOID);
 	{
@@ -1832,6 +1836,13 @@ std::vector<std::pair<uint32, uint32>> CCodeGen_Wasm::m_contextArrays;
 void CCodeGen_Wasm::SetContextPromotion(bool enabled)
 {
 	m_contextPromotion = enabled;
+}
+
+bool CCodeGen_Wasm::m_branchHints = true;
+
+void CCodeGen_Wasm::SetBranchHints(bool enabled)
+{
+	m_branchHints = enabled;
 }
 
 void CCodeGen_Wasm::SetFunctionName(std::string name)

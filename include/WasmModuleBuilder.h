@@ -23,6 +23,7 @@ public:
 		uint32 localF32Count = 0;
 		uint32 localV128Count = 0;
 		std::string name; //Written to a "name" custom section when not empty (profiling)
+		std::vector<std::pair<uint32, uint8>> branchHints; //Code offsets of hinted 'if's (1: likely, 0: unlikely), written to a branch hint section
 	};
 
 	static void WriteSLeb128(Framework::CStream&, int64);

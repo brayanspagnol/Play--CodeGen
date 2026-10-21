@@ -50,6 +50,8 @@ namespace Jitter
 		//registered so that symbols inside them are left in memory; a function that takes
 		//a reference to an unregistered part of the context is not promoted.
 		void SetContextPromotion(bool);
+		//Emit a branch hint section ("metadata.code.branch_hint") marking memory access fast paths as likely
+		static void SetBranchHints(bool);
 		static void RegisterContextArray(uint32 offset, uint32 size);
 		//Name for the next generated function (profiling); empty: no name section
 		void SetFunctionName(std::string);
@@ -325,6 +327,8 @@ namespace Jitter
 		bool m_contextPromotion = false;
 		bool m_usesBlockTable = false;
 		std::string m_functionName;
+		std::vector<std::pair<uint32, uint8>> m_branchHintOffsets; //Function stream offsets of hinted 'if's, 1: then branch likely, 0: unlikely
+		static bool m_branchHints;
 		std::map<PromotedKey, uint32> m_promotedLocations; //Container -> group-relative local index
 		std::map<PromotedKey, PROMOTED_ACCESS> m_promotedAccesses;
 		std::set<PromotedKey> m_promotedDirty;

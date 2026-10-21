@@ -5,6 +5,8 @@
 #include "MemStream.h"
 #include <cstdio>
 
+static const char* BRANCH_HINT_SECTION = "metadata.code.branch_hint";
+
 static void WriteName(Framework::CStream& stream, const char* str)
 {
 	auto length = strlen(str);
@@ -157,6 +159,31 @@ void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
 		stream.Write8(0); //Function index
 	}
 
+	//Custom section "metadata.code.branch_hint" (must come before the code section): offsets are relative to
+	//the start of the function body (its local declarations)
+	if(!m_functions[0].branchHints.empty())
+	{
+		const auto& function = m_functions[0];
+		uint32 localDeclSize = 1;
+		for(uint32 count : {function.localI32Count, function.localI64Count, function.localF32Count, function.localV128Count})
+		{
+			if(count != 0) localDeclSize += GetULeb128Size(count) + 1;
+		}
+		Framework::CMemStream section;
+		WriteName(section, BRANCH_HINT_SECTION);
+		section.Write8(1); //Functions
+		section.Write8(0); //Function index
+		WriteULeb128(section, function.branchHints.size());
+		for(const auto& hint : function.branchHints)
+		{
+			WriteULeb128(section, hint.first + localDeclSize);
+			section.Write8(1); //Hint size
+			section.Write8(hint.second);
+		}
+		WriteSectionHeader(stream, 0, section.GetSize());
+		stream.Write(section.GetBuffer(), section.GetSize());
+	}
+
 	//Section "Code"
 	{
 		const auto& function = m_functions[0];
@@ -298,6 +325,8 @@ std::vector<uint8> CWasmModuleBuilder::BuildBatchModule(const std::vector<MODULE
 		uint32 bodySize = 0;
 		const uint8* name = nullptr;  //function name (no length prefix)
 		uint32 nameSize = 0;
+		const uint8* hints = nullptr; //branch hints of function 0 (count and entries)
+		uint32 hintsSize = 0;
 	};
 	std::vector<SECTIONS> parsed;
 	parsed.reserve(modules.size());
@@ -343,6 +372,20 @@ std::vector<uint8> CWasmModuleBuilder::BuildBatchModule(const std::vector<MODULE
 			break;
 			case 0:
 			{
+				//Branch hints: name, count 1, index 0, then the function's hint vector
+				{
+					const uint8* p = content;
+					uint32 length = 0, count = 0, index = 0;
+					uint32 hintNameSize = static_cast<uint32>(strlen(BRANCH_HINT_SECTION));
+					if(ReadULeb128(p, contentEnd, length) && (length == hintNameSize) && (p + length <= contentEnd) && (memcmp(p, BRANCH_HINT_SECTION, length) == 0))
+					{
+						p += length;
+						if(!ReadULeb128(p, contentEnd, count) || (count != 1) || !ReadULeb128(p, contentEnd, index) || (index != 0)) return {};
+						sections.hints = p;
+						sections.hintsSize = static_cast<uint32>(contentEnd - p);
+						break;
+					}
+				}
 				//"name" section: name length (4), "name", subsection 1, size, count 1, index 0, name
 				const uint8* p = content;
 				uint32 length = 0, subSize = 0, count = 0, index = 0, nameSize = 0;
@@ -405,6 +448,24 @@ std::vector<uint8> CWasmModuleBuilder::BuildBatchModule(const std::vector<MODULE
 		}
 		WriteSectionHeader(stream, Wasm::SECTION_ID_EXPORT, section.GetSize());
 		stream.Write(section.GetBuffer(), section.GetSize());
+	}
+	{
+		uint32 hintedCount = 0;
+		for(const auto& sections : parsed) hintedCount += sections.hints ? 1 : 0;
+		if(hintedCount != 0)
+		{
+			Framework::CMemStream section;
+			WriteName(section, BRANCH_HINT_SECTION);
+			WriteULeb128(section, hintedCount);
+			for(uint32 i = 0; i < count; i++)
+			{
+				if(!parsed[i].hints) continue;
+				WriteULeb128(section, i);
+				section.Write(parsed[i].hints, parsed[i].hintsSize);
+			}
+			WriteSectionHeader(stream, 0, section.GetSize());
+			stream.Write(section.GetBuffer(), section.GetSize());
+		}
 	}
 	{
 		Framework::CMemStream section;
