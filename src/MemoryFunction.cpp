@@ -282,6 +282,14 @@ void CMemoryFunction::ReplaceWasmFunction(int fctId)
 	//code memory per module (64 KiB in Firefox, which allows only ~16k live modules per process)
 	m_wasmModule = emscripten::val();
 }
+
+CMemoryFunction CMemoryFunction::FromWasmFunction(int fctId, size_t size)
+{
+	CMemoryFunction result;
+	result.m_code = reinterpret_cast<void*>(fctId);
+	result.m_size = size;
+	return result;
+}
 #endif
 
 CMemoryFunction CMemoryFunction::CreateInstance()

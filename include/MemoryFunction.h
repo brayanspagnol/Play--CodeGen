@@ -38,6 +38,8 @@ public:
 	static std::vector<int> CreateWasmBatch(const void*, size_t, uint32 count);
 	//Calls fctId (a function from CreateWasmBatch, now owned by this object) instead of the current function
 	void ReplaceWasmFunction(int fctId);
+	//Takes ownership of fctId (a function table index, e.g. an export of a multi-function module)
+	static CMemoryFunction FromWasmFunction(int fctId, size_t size);
 #endif
 
 private:

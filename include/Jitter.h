@@ -21,6 +21,7 @@
 
 namespace Jitter
 {
+	class CInterpreterProgram;
 
 	class CJitter
 	{
@@ -259,6 +260,12 @@ namespace Jitter
 		void MD_UnpackUpperHW();
 		void MD_UnpackUpperWD();
 		void MD_Xor();
+
+		//Interpreter for the statements added since Begin() (call before End()); null when they use
+		//something the interpreter doesn't support (see Jitter_Interpreter.h)
+		std::shared_ptr<const CInterpreterProgram> BuildInterpreterProgram() const;
+		//Drops the statements added since Begin() without compiling them
+		void Abandon();
 
 		CCodeGen* GetCodeGen();
 

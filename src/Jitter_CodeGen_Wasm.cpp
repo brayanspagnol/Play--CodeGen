@@ -516,6 +516,11 @@ void CCodeGen_Wasm::SetPageAccessHandlers(const PAGE_ACCESS_HANDLERS& handlers)
 	m_pageAccessHandlers = handlers;
 }
 
+const CCodeGen_Wasm::PAGE_ACCESS_HANDLERS& CCodeGen_Wasm::GetPageAccessHandlers()
+{
+	return m_pageAccessHandlers;
+}
+
 bool CCodeGen_Wasm::SupportsPageAccess() const
 {
 	return m_pageAccessHandlers.load32 != 0;
@@ -2203,7 +2208,7 @@ void CCodeGen_Wasm::SetStructuredControlFlow(bool enabled)
 	m_structuredControlFlow = enabled;
 }
 
-bool CCodeGen_Wasm::m_branchHints = false;
+bool CCodeGen_Wasm::m_branchHints = true;
 
 void CCodeGen_Wasm::SetBranchHints(bool enabled)
 {
