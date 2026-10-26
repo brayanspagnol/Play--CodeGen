@@ -556,31 +556,42 @@ void CCodeGen_Wasm::Emit_Md_MakeSz_MemMem(const STATEMENT& statement)
 	auto src1 = statement.src1->GetSymbol().get();
 
 	static const uint8 zeroConst[0x10] = {0};
-
+	//Lanes in reverse order (w, z, y, x): bit 0 of the result is w, bit 3 is x
+	//(one pshufd + movmskps on x64, the byte shuffle + i16x8.bitmask form needed two pshufb with materialized masks)
 	// clang-format off
-	static const uint8 makeSzShufflePattern[0x10] =
+	static const uint8 reverseLanesPattern[0x10] =
 	{
-		0x1E, 0x1C, 0x1A, 0x18, 0x16, 0x14, 0x12, 0x10,
-		0x0E, 0x0C, 0x0A, 0x08, 0x06, 0x04, 0x02, 0x00,
+		0x0C, 0x0D, 0x0E, 0x0F, 0x08, 0x09, 0x0A, 0x0B,
+		0x04, 0x05, 0x06, 0x07, 0x00, 0x01, 0x02, 0x03,
 	};
 	// clang-format on
 
+	auto pushReversed = [&]() {
+		PrepareSymbolUse(src1);
+		PrepareSymbolUse(src1);
+		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+		CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I8x16_SHUFFLE);
+		m_functionStream.Write(reverseLanesPattern, 0x10);
+	};
+
 	PrepareSymbolDef(dst);
 
-	//Compute sign
+	//Sign bits (bits 4-7)
 	{
-		PrepareSymbolUse(src1);
-
-		m_functionStream.Write8(Wasm::INST_I32_CONST);
-		m_functionStream.Write8(31);
+		pushReversed();
 
 		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
-		CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I32x4_SHR_S);
+		CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I32x4_BITMASK);
+
+		m_functionStream.Write8(Wasm::INST_I32_CONST);
+		m_functionStream.Write8(4);
+
+		m_functionStream.Write8(Wasm::INST_I32_SHL);
 	}
 
-	//Compute zero
+	//Zero bits (bits 0-3)
 	{
-		PrepareSymbolUse(src1);
+		pushReversed();
 
 		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
 		m_functionStream.Write8(Wasm::INST_V128_CONST);
@@ -588,16 +599,12 @@ void CCodeGen_Wasm::Emit_Md_MakeSz_MemMem(const STATEMENT& statement)
 
 		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
 		m_functionStream.Write8(Wasm::INST_F32x4_EQ);
+
+		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+		CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I32x4_BITMASK);
 	}
 
-	//Merge sign and zero
-	m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
-	CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I8x16_SHUFFLE);
-	m_functionStream.Write(makeSzShufflePattern, 0x10);
-
-	//Extract bits
-	m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
-	CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I16x8_BITMASK);
+	m_functionStream.Write8(Wasm::INST_I32_OR);
 
 	CommitSymbol(dst);
 }
@@ -783,15 +790,20 @@ void CCodeGen_Wasm::Emit_Md_ExpandW_MemMemCst(const STATEMENT& statement)
 	assert(src2->m_type == SYM_CONSTANT);
 	assert(src2->m_valueLow < 4);
 
+	//Lane broadcast as a swizzle (one pshufd on x64; extract_lane + splat goes through a general register)
+	uint8 pattern[0x10];
+	for(uint32 i = 0; i < 0x10; i++)
+	{
+		pattern[i] = static_cast<uint8>((src2->m_valueLow * 4) + (i & 3));
+	}
+
 	PrepareSymbolDef(dst);
+	PrepareSymbolUse(src1);
 	PrepareSymbolUse(src1);
 
 	m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
-	m_functionStream.Write8(Wasm::INST_I32x4_EXTRACT_LANE);
-	m_functionStream.Write8(src2->m_valueLow);
-
-	m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
-	m_functionStream.Write8(Wasm::INST_I32x4_SPLAT);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, Wasm::INST_I8x16_SHUFFLE);
+	m_functionStream.Write(pattern, 0x10);
 
 	CommitSymbol(dst);
 }
