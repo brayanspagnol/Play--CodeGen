@@ -307,8 +307,15 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	if(m_contextPromotion)
 	{
 		PreparePromotion(statements);
+		FindWrittenFirstPromoted(statements);
 	}
-	EmitPromotedLoadAll();
+	//(Containers whose first access overwrites them are not loaded at entry: wasm loads can trap,
+	//so the engine keeps loads whose value is never used)
+	for(const auto& locationPair : m_promotedLocations)
+	{
+		if(m_promotedWrittenFirst.count(locationPair.first)) continue;
+		EmitPromotedLoad(locationPair.first);
+	}
 
 	for(auto statementIterator = statements.begin(); statementIterator != statements.end(); statementIterator++)
 	{
@@ -2311,6 +2318,56 @@ void CCodeGen_Wasm::EmitPromotedStore(const PromotedKey& key)
 		break;
 	}
 	CWasmModuleBuilder::WriteULeb128(m_functionStream, key.second);
+}
+
+void CCodeGen_Wasm::FindWrittenFirstPromoted(const StatementList& statements)
+{
+	//Promoted containers wholly written before any read on every path from the function entry:
+	//scans the code that runs unconditionally from the start (ifs are skipped over, the loop head
+	//is fine: a value coming back through the loop is overwritten the same way) and stops at the
+	//first jump or anything that stores the promoted values (calls, slow paths, exits).
+	m_promotedWrittenFirst.clear();
+	std::set<PromotedKey> decided;
+	uint32 ifDepth = 0;
+	for(const auto& statement : statements)
+	{
+		switch(statement.op)
+		{
+		case OP_LABEL:
+		{
+			auto labelFlowIterator = m_labelFlows.find(statement.jmpBlock);
+			assert(labelFlowIterator != std::end(m_labelFlows));
+			if(labelFlowIterator->second == LABEL_FLOW_IF) ifDepth++;
+			if(labelFlowIterator->second == LABEL_FLOW_ENDIF) ifDepth--;
+			continue;
+		}
+		case OP_JMP:
+		case OP_CALL:
+		case OP_EXTERNJMP:
+		case OP_EXTERNJMP_IDX:
+		case OP_LOADFROMPAGE:
+		case OP_STOREATPAGE:
+			return;
+		default:
+			break;
+		}
+		if(statement.op == OP_EXTERNJMP_LINK) return;
+		std::set<PromotedKey> reads;
+		statement.VisitSources([&](const SymbolRefPtr& symbolRef, bool) {
+			auto symbol = symbolRef->GetSymbol().get();
+			if(IsPromoted(symbol)) reads.insert(GetPromotedAccess(symbol).container);
+		});
+		for(const auto& container : reads) decided.insert(container);
+		statement.VisitDestination([&](const SymbolRefPtr& symbolRef, bool) {
+			auto symbol = symbolRef->GetSymbol().get();
+			if(!IsPromoted(symbol)) return;
+			const auto& access = GetPromotedAccess(symbol);
+			if(decided.count(access.container)) return;
+			decided.insert(access.container);
+			//(A bitcast member covers its whole i32 container)
+			if((ifDepth == 0) && (access.kind != PROMOTED_LANE)) m_promotedWrittenFirst.insert(access.container);
+		});
+	}
 }
 
 void CCodeGen_Wasm::EmitPromotedLoadAll()

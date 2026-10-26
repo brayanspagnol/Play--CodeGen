@@ -152,6 +152,7 @@ namespace Jitter
 		void EmitPromotedLoad(const PromotedKey&);
 		void EmitPromotedStore(const PromotedKey&);
 		void EmitPromotedLoadAll();
+		void FindWrittenFirstPromoted(const StatementList&);
 		void EmitPromotedStoreDirty();
 
 		void PushContext();
@@ -337,6 +338,7 @@ namespace Jitter
 		std::map<PromotedKey, uint32> m_promotedLocations; //Container -> group-relative local index
 		std::map<PromotedKey, PROMOTED_ACCESS> m_promotedAccesses;
 		std::set<PromotedKey> m_promotedDirty;
+		std::set<PromotedKey> m_promotedWrittenFirst;
 		uint32 m_scratchI32Local = 0;
 		std::vector<uint32> m_relativeOffsets; //Context offsets of pushed relative addresses, used by their load/store memarg
 		uint32 m_scratchI64Local = 0;
