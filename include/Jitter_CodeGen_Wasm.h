@@ -55,6 +55,8 @@ namespace Jitter
 		static void RegisterContextArray(uint32 offset, uint32 size);
 		//Name for the next generated function (profiling); empty: no name section
 		void SetFunctionName(std::string);
+		//Guest address of the next function's block (link target, see CWasmModuleBuilder::LINK_SITE), ~0: none
+		void SetLinkAddress(uint32);
 
 	private:
 		enum LABEL_FLOW
@@ -229,6 +231,7 @@ namespace Jitter
 
 		void Emit_ExternJmp(const STATEMENT&);
 		void Emit_ExternJmpIdx(const STATEMENT&);
+		void Emit_ExternJmpLink(const STATEMENT&);
 
 		void Emit_Jmp(const STATEMENT&);
 		void Emit_CondJmp_AnyAny(const STATEMENT&);
@@ -326,7 +329,9 @@ namespace Jitter
 
 		bool m_contextPromotion = false;
 		bool m_usesBlockTable = false;
+		std::vector<CWasmModuleBuilder::LINK_SITE> m_linkSites;
 		std::string m_functionName;
+		uint32 m_linkAddress = ~0U;
 		std::vector<std::pair<uint32, uint8>> m_branchHintOffsets; //Function stream offsets of hinted 'if's, 1: then branch likely, 0: unlikely
 		static bool m_branchHints;
 		std::map<PromotedKey, uint32> m_promotedLocations; //Container -> group-relative local index

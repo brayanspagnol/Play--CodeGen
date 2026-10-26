@@ -52,7 +52,8 @@ EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle),
 		env: {
 			memory: wasmMemory,
 			fctTable : Module.codeGenImportTable,
-			blockTable : wasmTable
+			blockTable : wasmTable,
+			linkBase : 0
 		}
 	});
 	let fct = moduleInstance.exports.codeGenFunc;
@@ -64,16 +65,33 @@ EM_JS(int, WasmCreateBatch, (uintptr_t code, uintptr_t size, int count, int* fct
 	try
 	{
 		let module = new WebAssembly.Module(HEAP8.subarray(code, code + size));
+		//Link sites (CWasmModuleBuilder::LINK_SITE) expect function i at table index linkBase + i: those slots are
+		//new and never given to another function later (see WasmDeleteFunction), so a site never mistakes another
+		//function for the one it calls directly
+		let linked = WebAssembly.Module.imports(module).some(i => i.name == "linkBase");
+		let linkBase = linked ? wasmTable.grow(count) : 0;
 		let instance = new WebAssembly.Instance(module, {
 			env: {
 				memory: wasmMemory,
 				fctTable : Module.codeGenImportTable,
-				blockTable : wasmTable
+				blockTable : wasmTable,
+				linkBase : linkBase
 			}
 		});
+		let linkedSlots = linked ? (Module.jitLinkedSlots ??= new Set()) : null;
 		for(let i = 0; i < count; i++)
 		{
-			HEAP32[(fctIds >> 2) + i] = addFunction(instance.exports["f" + i], 'vi');
+			let fct = instance.exports["f" + i];
+			if(linked)
+			{
+				setWasmTableEntry(linkBase + i, fct);
+				linkedSlots.add(linkBase + i);
+				HEAP32[(fctIds >> 2) + i] = linkBase + i;
+			}
+			else
+			{
+				HEAP32[(fctIds >> 2) + i] = addFunction(fct, 'vi');
+			}
 		}
 		return 1;
 	}
@@ -92,6 +110,13 @@ EM_JS(int, WasmCloneFunction, (int fctId),
 });
 EM_JS(void, WasmDeleteFunction, (int fctId),
 {
+	//Slots of linked functions are never reused (see WasmCreateBatch); block cache group slots stay as they are
+	if(Module.jitPermanentSlots && Module.jitPermanentSlots.has(fctId)) return;
+	if(Module.jitLinkedSlots && Module.jitLinkedSlots.delete(fctId))
+	{
+		setWasmTableEntry(fctId, null);
+		return;
+	}
 	removeFunction(fctId);
 });
 EM_JS(emscripten::EM_VAL, WasmCreateModule, (uintptr_t code, uintptr_t size),

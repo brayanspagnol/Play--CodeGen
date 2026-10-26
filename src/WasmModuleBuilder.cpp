@@ -6,6 +6,7 @@
 #include <cstdio>
 
 static const char* BRANCH_HINT_SECTION = "metadata.code.branch_hint";
+static const char* LINK_SECTION = "play.link";
 
 static void WriteName(Framework::CStream& stream, const char* str)
 {
@@ -69,6 +70,17 @@ uint32 CWasmModuleBuilder::GetULeb128Size(uint32 value)
 	return size;
 }
 
+void CWasmModuleBuilder::WritePaddedLeb128(uint8* bytes, int32 value)
+{
+	assert((value >= -0x40000000) && (value < 0x40000000));
+	for(uint32 i = 0; i < 4; i++)
+	{
+		bytes[i] = (value & 0x7F) | 0x80;
+		value >>= 7;
+	}
+	bytes[4] = value & 0x7F;
+}
+
 void CWasmModuleBuilder::AddFunctionType(FUNCTION_TYPE functionType)
 {
 	m_functionTypes.push_back(std::move(functionType));
@@ -82,6 +94,11 @@ void CWasmModuleBuilder::AddFunction(FUNCTION function)
 void CWasmModuleBuilder::SetImportsBlockTable(bool importsBlockTable)
 {
 	m_importsBlockTable = importsBlockTable;
+}
+
+void CWasmModuleBuilder::SetImportsLinkBase(bool importsLinkBase)
+{
+	m_importsLinkBase = importsLinkBase;
 }
 
 void CWasmModuleBuilder::SetFunctionTypeIndex(uint32 index)
@@ -134,6 +151,7 @@ void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
 		}
 	}
 
+	m_importsLinkBase = !m_functions[0].linkSites.empty();
 	WriteImportSection(stream);
 
 	//Section "Function"
@@ -241,6 +259,32 @@ void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
 		stream.Write(function.code.data(), function.code.size());
 	}
 
+	//Custom section "play.link": guest address of function 0's block, then its link sites, offsets from the start of
+	//its body like branch hints
+	if(!m_functions[0].linkSites.empty() || (m_functions[0].linkAddress != ~0U))
+	{
+		const auto& function = m_functions[0];
+		uint32 localDeclSize = 1;
+		for(uint32 count : {function.localI32Count, function.localI64Count, function.localF32Count, function.localV128Count})
+		{
+			if(count != 0) localDeclSize += GetULeb128Size(count) + 1;
+		}
+		Framework::CMemStream section;
+		WriteName(section, LINK_SECTION);
+		WriteULeb128(section, function.linkAddress);
+		WriteULeb128(section, function.linkSites.size());
+		for(const auto& site : function.linkSites)
+		{
+			WriteULeb128(section, site.target);
+			WriteULeb128(section, site.start + localDeclSize);
+			WriteULeb128(section, site.end + localDeclSize);
+			WriteULeb128(section, site.indexOffset + localDeclSize);
+			WriteULeb128(section, site.functionOffset + localDeclSize);
+		}
+		WriteSectionHeader(stream, 0, section.GetSize());
+		stream.Write(section.GetBuffer(), section.GetSize());
+	}
+
 	//Custom section "name" (function names subsection), lets profilers tell blocks apart
 	if(!m_functions[0].name.empty())
 	{
@@ -267,11 +311,15 @@ void CWasmModuleBuilder::WriteSectionHeader(Framework::CStream& stream, uint8 se
 
 void CWasmModuleBuilder::WriteImportSection(Framework::CStream& stream)
 {
-	//Table import: module name (1 + 3), field name (1 + n), kind, reftype, flags, initial
-	const uint32 blockTableImportSize = 4 + 1 + 10 + 4;
-	WriteSectionHeader(stream, Wasm::SECTION_ID_IMPORT, 0x23 + (m_importsBlockTable ? blockTableImportSize : 0));
+	Framework::CMemStream section;
+	WriteImportEntries(section);
+	WriteSectionHeader(stream, Wasm::SECTION_ID_IMPORT, section.GetSize());
+	stream.Write(section.GetBuffer(), section.GetSize());
+}
 
-	stream.Write8(m_importsBlockTable ? 3 : 2); //Import vector size
+void CWasmModuleBuilder::WriteImportEntries(Framework::CStream& stream)
+{
+	stream.Write8(2 + (m_importsBlockTable ? 1 : 0) + (m_importsLinkBase ? 1 : 0)); //Import vector size
 
 	//Import 0
 	WriteName(stream, "env");    //Import module name
@@ -298,6 +346,15 @@ void CWasmModuleBuilder::WriteImportSection(Framework::CStream& stream)
 		stream.Write8(0x00); //Flags
 		stream.Write8(0x01); //Initial
 	}
+
+	if(m_importsLinkBase)
+	{
+		WriteName(stream, "env");
+		WriteName(stream, "linkBase");
+		stream.Write8(Wasm::IMPORT_EXPORT_TYPE_GLOBAL);
+		stream.Write8(Wasm::TYPE_I32);
+		stream.Write8(0x00); //Immutable
+	}
 }
 
 static bool ReadULeb128(const uint8*& ptr, const uint8* end, uint32& value)
@@ -311,6 +368,56 @@ static bool ReadULeb128(const uint8*& ptr, const uint8* end, uint32& value)
 		if((byte & 0x80) == 0) return true;
 	}
 	return false;
+}
+
+//Import section entries: tells which optional imports (env.blockTable, env.linkBase) a module has
+static bool ParseImports(const uint8* p, const uint8* end, bool& importsBlockTable, bool& importsLinkBase)
+{
+	uint32 count = 0;
+	if(!ReadULeb128(p, end, count)) return false;
+	for(uint32 i = 0; i < count; i++)
+	{
+		uint32 length = 0, value = 0;
+		if(!ReadULeb128(p, end, length) || (length > static_cast<uint32>(end - p))) return false;
+		p += length;
+		if(!ReadULeb128(p, end, length) || (length > static_cast<uint32>(end - p))) return false;
+		const uint8* field = p;
+		p += length;
+		if(p + 2 > end) return false;
+		uint8 kind = *p++;
+		auto isField = [&](const char* name) { return (strlen(name) == length) && (memcmp(field, name, length) == 0); };
+		switch(kind)
+		{
+		case Wasm::IMPORT_EXPORT_TYPE_FUNCTION:
+			if(!ReadULeb128(p, end, value)) return false;
+			break;
+		case Wasm::IMPORT_EXPORT_TYPE_TABLE:
+		{
+			p++; //Reftype
+			if(p >= end) return false;
+			uint8 flags = *p++;
+			if(!ReadULeb128(p, end, value)) return false;
+			if((flags & 1) && !ReadULeb128(p, end, value)) return false;
+			if(isField("blockTable")) importsBlockTable = true;
+		}
+		break;
+		case Wasm::IMPORT_EXPORT_TYPE_MEMORY:
+		{
+			uint8 flags = *p++;
+			if(!ReadULeb128(p, end, value)) return false;
+			if((flags & 1) && !ReadULeb128(p, end, value)) return false;
+		}
+		break;
+		case Wasm::IMPORT_EXPORT_TYPE_GLOBAL:
+			p += 2; //Value type, mutability
+			if(p > end) return false;
+			if(isField("linkBase")) importsLinkBase = true;
+			break;
+		default:
+			return false;
+		}
+	}
+	return true;
 }
 
 std::vector<uint8> CWasmModuleBuilder::BuildBatchModule(const std::vector<MODULE_BYTES>& modules)
@@ -327,11 +434,14 @@ std::vector<uint8> CWasmModuleBuilder::BuildBatchModule(const std::vector<MODULE
 		uint32 nameSize = 0;
 		const uint8* hints = nullptr; //branch hints of function 0 (count and entries)
 		uint32 hintsSize = 0;
+		std::vector<LINK_SITE> linkSites; //offsets from the start of the body (after its size prefix)
+		uint32 linkAddress = ~0U;
 	};
 	std::vector<SECTIONS> parsed;
 	parsed.reserve(modules.size());
 	uint32 largestTypeModule = 0;
 	bool importsBlockTable = false;
+	bool importsLinkBase = false;
 	bool hasNames = false;
 	for(const auto& module : modules)
 	{
@@ -353,7 +463,7 @@ std::vector<uint8> CWasmModuleBuilder::BuildBatchModule(const std::vector<MODULE
 				sections.typeSize = size;
 				break;
 			case Wasm::SECTION_ID_IMPORT:
-				sections.importCount = content[0];
+				if(!ParseImports(content, contentEnd, importsBlockTable, importsLinkBase)) return {};
 				break;
 			case Wasm::SECTION_ID_FUNCTION:
 				if((size != 2) || (content[0] != 1)) return {};
@@ -386,6 +496,25 @@ std::vector<uint8> CWasmModuleBuilder::BuildBatchModule(const std::vector<MODULE
 						break;
 					}
 				}
+				//Link sites: name, own address, count, (target, start, end, index offset, function offset) per site
+				{
+					const uint8* p = content;
+					uint32 length = 0, count = 0;
+					uint32 linkNameSize = static_cast<uint32>(strlen(LINK_SECTION));
+					if(ReadULeb128(p, contentEnd, length) && (length == linkNameSize) && (p + length <= contentEnd) && (memcmp(p, LINK_SECTION, length) == 0))
+					{
+						p += length;
+						if(!ReadULeb128(p, contentEnd, sections.linkAddress) || !ReadULeb128(p, contentEnd, count)) return {};
+						for(uint32 i = 0; i < count; i++)
+						{
+							LINK_SITE site;
+							if(!ReadULeb128(p, contentEnd, site.target) || !ReadULeb128(p, contentEnd, site.start) || !ReadULeb128(p, contentEnd, site.end) ||
+							   !ReadULeb128(p, contentEnd, site.indexOffset) || !ReadULeb128(p, contentEnd, site.functionOffset)) return {};
+							sections.linkSites.push_back(site);
+						}
+						break;
+					}
+				}
 				//"name" section: name length (4), "name", subsection 1, size, count 1, index 0, name
 				const uint8* p = content;
 				uint32 length = 0, subSize = 0, count = 0, index = 0, nameSize = 0;
@@ -404,7 +533,6 @@ std::vector<uint8> CWasmModuleBuilder::BuildBatchModule(const std::vector<MODULE
 			ptr = contentEnd;
 		}
 		if(!sections.type || !sections.body) return {};
-		if(sections.importCount == 3) importsBlockTable = true;
 		if(sections.name) hasNames = true;
 		if((parsed.empty()) || (sections.typeSize > parsed[largestTypeModule].typeSize)) largestTypeModule = static_cast<uint32>(parsed.size());
 		parsed.push_back(sections);
@@ -422,6 +550,7 @@ std::vector<uint8> CWasmModuleBuilder::BuildBatchModule(const std::vector<MODULE
 	{
 		CWasmModuleBuilder builder;
 		builder.SetImportsBlockTable(importsBlockTable);
+		builder.SetImportsLinkBase(importsLinkBase);
 		Framework::CMemStream importStream;
 		builder.WriteImportSection(importStream);
 		stream.Write(importStream.GetBuffer(), importStream.GetSize());
@@ -470,7 +599,38 @@ std::vector<uint8> CWasmModuleBuilder::BuildBatchModule(const std::vector<MODULE
 	{
 		Framework::CMemStream section;
 		WriteULeb128(section, count);
-		for(const auto& sections : parsed) section.Write(sections.body, sections.bodySize);
+		std::vector<uint8> body;
+		for(const auto& sections : parsed)
+		{
+			if(sections.linkSites.empty())
+			{
+				section.Write(sections.body, sections.bodySize);
+				continue;
+			}
+			//Link sites to another function of this batch become direct calls; the others are not needed
+			body.assign(sections.body, sections.body + sections.bodySize);
+			const uint8* p = sections.body;
+			uint32 bodySize = 0;
+			ReadULeb128(p, sections.body + sections.bodySize, bodySize);
+			uint8* code = body.data() + (p - sections.body);
+			for(const auto& site : sections.linkSites)
+			{
+				if((site.end > bodySize) || (site.start >= site.end) || (site.indexOffset + 5 > site.end) || (site.functionOffset + 5 > site.end)) return {};
+				int32 linked = -1;
+				for(uint32 i = 0; i < count; i++)
+				{
+					if(parsed[i].linkAddress == site.target) linked = static_cast<int32>(i);
+				}
+				if(linked < 0)
+				{
+					memset(code + site.start, 0x01, site.end - site.start); //nop
+					continue;
+				}
+				WritePaddedLeb128(code + site.indexOffset, linked);
+				WritePaddedLeb128(code + site.functionOffset, linked);
+			}
+			section.Write(body.data(), body.size());
+		}
 		WriteSectionHeader(stream, Wasm::SECTION_ID_CODE, section.GetSize());
 		stream.Write(section.GetBuffer(), section.GetSize());
 	}

@@ -1032,6 +1032,9 @@ void CInterpreterProgram::Run(void* context) const
 		case OP_EXTERNJMP:
 			reinterpret_cast<void (*)(void*)>(static_cast<uintptr_t>(i.src1.value))(context);
 			break;
+		case OP_EXTERNJMP_LINK:
+			//Never linked in the interpreter: the block returns to its executor
+			break;
 		case OP_EXTERNJMP_IDX:
 		{
 			uint32 functionIndex = r32(i.src1);

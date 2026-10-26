@@ -129,6 +129,7 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
 
 	{ OP_EXTERNJMP,      MATCH_NIL,            MATCH_CONSTANTPTR,    MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_ExternJmp                              },
 	{ OP_EXTERNJMP_IDX,  MATCH_NIL,            MATCH_ANY32,          MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_ExternJmpIdx                           },
+	{ OP_EXTERNJMP_LINK, MATCH_NIL,            MATCH_CONSTANT,       MATCH_CONSTANT,      MATCH_NIL,      &CCodeGen_Wasm::Emit_ExternJmpLink                          },
 
 	{ OP_JMP,            MATCH_NIL,            MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Jmp                                    },
 
@@ -281,6 +282,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	m_currentBlockDepth = 0;
 	m_loopBlock = -1;
 	m_usesBlockTable = false;
+	m_linkSites.clear();
 	m_promotedLocations.clear();
 	m_promotedAccesses.clear();
 	m_promotedDirty.clear();
@@ -362,6 +364,10 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	function.localV128Count = m_localV128Count;
 	function.name = std::move(m_functionName);
 	if(m_branchHints) function.branchHints = m_branchHintOffsets;
+	function.linkSites = std::move(m_linkSites);
+	function.linkAddress = m_linkAddress;
+	m_linkSites.clear();
+	m_linkAddress = ~0U;
 	m_functionName.clear();
 
 	moduleBuilder.SetImportsBlockTable(m_usesBlockTable);
@@ -1593,6 +1599,62 @@ void CCodeGen_Wasm::Emit_ExternJmpIdx(const STATEMENT& statement)
 	m_usesBlockTable = true;
 }
 
+void CCodeGen_Wasm::Emit_ExternJmpLink(const STATEMENT& statement)
+{
+	//Link site (see CWasmModuleBuilder::LINK_SITE), as written here it never jumps:
+	//  if(fnTable[target >> 16][(target & 0xFFFF) / 4] == linkBase + k) return_call f(context)
+	//with k = LINK_SITE::UNLINKED (no table index matches) and f = 0 (any valid index). Module batching patches k and f when
+	//the target block is function k of the same batch module, whose table index is linkBase + k: a direct
+	//tail call, valid as long as the table still holds that function at the target (the block can be
+	//replaced or deleted any time, and its slot is never given to another function, see CMemoryFunction).
+	uint32 target = statement.src1->GetSymbol()->m_valueLow;
+	uint32 fnTableOffset = statement.src2->GetSymbol()->m_valueLow;
+
+	EmitPromotedStoreDirty();
+
+	CWasmModuleBuilder::LINK_SITE site;
+	site.target = target;
+	site.start = static_cast<uint32>(m_functionStream.GetSize());
+
+	PushContext();
+	m_functionStream.Write8(Wasm::INST_I32_LOAD);
+	m_functionStream.Write8(0x02);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, fnTableOffset);
+	m_functionStream.Write8(Wasm::INST_I32_LOAD);
+	m_functionStream.Write8(0x02);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, ((target >> 16) & 0x1FFF) * 4);
+	m_functionStream.Write8(Wasm::INST_I32_LOAD);
+	m_functionStream.Write8(0x02);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, ((target & 0xFFFF) / 4) * 4);
+
+	m_functionStream.Write8(Wasm::INST_GLOBAL_GET);
+	m_functionStream.Write8(0x00); //env.linkBase
+	m_functionStream.Write8(Wasm::INST_I32_CONST);
+	site.indexOffset = static_cast<uint32>(m_functionStream.GetSize());
+	{
+		uint8 bytes[5];
+		CWasmModuleBuilder::WritePaddedLeb128(bytes, CWasmModuleBuilder::LINK_SITE::UNLINKED);
+		m_functionStream.Write(bytes, 5);
+	}
+	m_functionStream.Write8(Wasm::INST_I32_ADD);
+	m_functionStream.Write8(Wasm::INST_I32_EQ);
+
+	m_functionStream.Write8(Wasm::INST_IF);
+	m_functionStream.Write8(Wasm::BLOCK_TYPE_VOID);
+	PushContext();
+	m_functionStream.Write8(Wasm::INST_RETURN_CALL);
+	site.functionOffset = static_cast<uint32>(m_functionStream.GetSize());
+	{
+		uint8 bytes[5];
+		CWasmModuleBuilder::WritePaddedLeb128(bytes, 0);
+		m_functionStream.Write(bytes, 5);
+	}
+	m_functionStream.Write8(Wasm::INST_END);
+
+	site.end = static_cast<uint32>(m_functionStream.GetSize());
+	m_linkSites.push_back(site);
+}
+
 void CCodeGen_Wasm::Emit_Jmp(const STATEMENT& statement)
 {
 	auto labelFlowIterator = m_labelFlows.find(statement.jmpBlock);
@@ -1843,6 +1905,11 @@ bool CCodeGen_Wasm::m_branchHints = true;
 void CCodeGen_Wasm::SetBranchHints(bool enabled)
 {
 	m_branchHints = enabled;
+}
+
+void CCodeGen_Wasm::SetLinkAddress(uint32 address)
+{
+	m_linkAddress = address;
 }
 
 void CCodeGen_Wasm::SetFunctionName(std::string name)

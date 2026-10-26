@@ -347,6 +347,15 @@ void CJitter::JumpToIndirect()
 	InsertStatement(statement);
 }
 
+void CJitter::JumpToLinked(uint32 target, uint32 fnTableOffset)
+{
+	STATEMENT statement;
+	statement.src1 = MakeSymbolRef(MakeSymbol(SYM_CONSTANT, target));
+	statement.src2 = MakeSymbolRef(MakeSymbol(SYM_CONSTANT, fnTableOffset));
+	statement.op = OP_EXTERNJMP_LINK;
+	InsertStatement(statement);
+}
+
 void CJitter::Lookup(uint32* table)
 {
 	throw std::exception();
