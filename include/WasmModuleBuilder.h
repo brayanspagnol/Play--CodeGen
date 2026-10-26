@@ -68,6 +68,8 @@ public:
 	//Link sites to another function of the batch (by the guest addresses in "play.link" sections) are patched
 	//to call it directly, the others are removed (see LINK_SITE). The batch imports env.linkBase if any module does.
 	static std::vector<uint8> BuildBatchModule(const std::vector<MODULE_BYTES>&);
+	//Guest address in a module's "play.link" section (~0 if it has none)
+	static uint32 GetLinkAddress(const MODULE_BYTES&);
 
 private:
 	static void WriteSectionHeader(Framework::CStream&, uint8, uint32);

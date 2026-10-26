@@ -420,6 +420,27 @@ static bool ParseImports(const uint8* p, const uint8* end, bool& importsBlockTab
 	return true;
 }
 
+uint32 CWasmModuleBuilder::GetLinkAddress(const MODULE_BYTES& module)
+{
+	if(module.size < 8) return ~0U;
+	const uint8* ptr = module.data + 8;
+	const uint8* end = module.data + module.size;
+	uint32 linkNameSize = static_cast<uint32>(strlen(LINK_SECTION));
+	while(ptr < end)
+	{
+		uint8 id = *ptr++;
+		uint32 size = 0;
+		if(!ReadULeb128(ptr, end, size) || (size > static_cast<uint32>(end - ptr))) return ~0U;
+		const uint8* p = ptr;
+		ptr += size;
+		uint32 length = 0, address = 0;
+		if((id != 0) || !ReadULeb128(p, ptr, length) || (length != linkNameSize) || (p + length > ptr) || (memcmp(p, LINK_SECTION, length) != 0)) continue;
+		p += length;
+		return ReadULeb128(p, ptr, address) ? address : ~0U;
+	}
+	return ~0U;
+}
+
 std::vector<uint8> CWasmModuleBuilder::BuildBatchModule(const std::vector<MODULE_BYTES>& modules)
 {
 	struct SECTIONS
