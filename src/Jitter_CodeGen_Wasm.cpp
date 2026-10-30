@@ -288,6 +288,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
 	m_promotedDirty.clear();
 	m_relativeOffsets.clear();
 	m_branchHintOffsets.clear();
+	FindContextRefs(statements);
 
 	BuildLabelFlows(statements);
 	PrepareSignatures(moduleBuilder, statements);
@@ -1079,6 +1080,45 @@ void CCodeGen_Wasm::PushContext()
 	m_functionStream.Write8(0x00);
 }
 
+void CCodeGen_Wasm::FindContextRefs(const StatementList& statements)
+{
+	m_contextRefs.clear();
+	std::map<uint32, uint32> defCounts;
+	for(const auto& statement : statements)
+	{
+		statement.VisitOperands(
+		    [&](const SymbolRefPtr& symbolRef, bool isDef) {
+			    auto symbol = symbolRef->GetSymbol();
+			    if(isDef && (symbol->m_type == SYM_TMP_REFERENCE)) defCounts[symbol->m_valueLow]++;
+		    });
+		if((statement.op == OP_RELTOREF) && (statement.src1->GetSymbol()->m_type == SYM_CONSTANT))
+		{
+			m_contextRefs[statement.dst->GetSymbol()->m_valueLow] = statement.src1->GetSymbol()->m_valueLow;
+		}
+	}
+	for(auto refIterator = m_contextRefs.begin(); refIterator != m_contextRefs.end();)
+	{
+		refIterator = (defCounts[refIterator->first] == 1) ? std::next(refIterator) : m_contextRefs.erase(refIterator);
+	}
+}
+
+uint32 CCodeGen_Wasm::PushRefBase(CSymbol* symbol)
+{
+	//A reference to context + constant: push the context, the constant becomes the memarg offset
+	//(one address computation for the slots of several context arrays at the same index)
+	if(symbol->m_type == SYM_TMP_REFERENCE)
+	{
+		auto refIterator = m_contextRefs.find(symbol->m_valueLow);
+		if(refIterator != m_contextRefs.end())
+		{
+			PushContext();
+			return refIterator->second;
+		}
+	}
+	PrepareSymbolUse(symbol);
+	return 0;
+}
+
 void CCodeGen_Wasm::PushRelativeAddress(CSymbol* symbol)
 {
 	assert(
@@ -1402,11 +1442,11 @@ void CCodeGen_Wasm::Emit_LoadFromRef_VarVar(const STATEMENT& statement)
 	auto src1 = statement.src1->GetSymbol().get();
 
 	PrepareSymbolDef(dst);
-	PrepareSymbolUse(src1);
+	uint32 offset = PushRefBase(src1);
 
 	m_functionStream.Write8(Wasm::INST_I32_LOAD);
 	m_functionStream.Write8(0x02);
-	m_functionStream.Write8(0x00);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, offset);
 
 	CommitSymbol(dst);
 }
@@ -1421,7 +1461,7 @@ void CCodeGen_Wasm::Emit_LoadFromRef_VarVarAny(const STATEMENT& statement)
 	assert((scale == 1) || (scale == 4));
 
 	PrepareSymbolDef(dst);
-	PrepareSymbolUse(src1);
+	uint32 offset = PushRefBase(src1);
 	PrepareSymbolUse(src2);
 
 	switch(scale)
@@ -1443,7 +1483,7 @@ void CCodeGen_Wasm::Emit_LoadFromRef_VarVarAny(const STATEMENT& statement)
 
 	m_functionStream.Write8(Wasm::INST_I32_LOAD);
 	m_functionStream.Write8(0x02);
-	m_functionStream.Write8(0x00);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, offset);
 
 	CommitSymbol(dst);
 }
@@ -1453,12 +1493,12 @@ void CCodeGen_Wasm::Emit_StoreAtRef_VarAny(const STATEMENT& statement)
 	auto src1 = statement.src1->GetSymbol().get();
 	auto src2 = statement.src2->GetSymbol().get();
 
-	PrepareSymbolUse(src1);
+	uint32 offset = PushRefBase(src1);
 	PrepareSymbolUse(src2);
 
 	m_functionStream.Write8(Wasm::INST_I32_STORE);
 	m_functionStream.Write8(0x02);
-	m_functionStream.Write8(0x00);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, offset);
 }
 
 void CCodeGen_Wasm::Emit_StoreAtRef_VarAnyAny(const STATEMENT& statement)
@@ -1470,7 +1510,7 @@ void CCodeGen_Wasm::Emit_StoreAtRef_VarAnyAny(const STATEMENT& statement)
 
 	assert((scale == 1) || (scale == 4));
 
-	PrepareSymbolUse(src1);
+	uint32 offset = PushRefBase(src1);
 	PrepareSymbolUse(src2);
 
 	switch(scale)
@@ -1494,7 +1534,7 @@ void CCodeGen_Wasm::Emit_StoreAtRef_VarAnyAny(const STATEMENT& statement)
 
 	m_functionStream.Write8(Wasm::INST_I32_STORE);
 	m_functionStream.Write8(0x02);
-	m_functionStream.Write8(0x00);
+	CWasmModuleBuilder::WriteULeb128(m_functionStream, offset);
 }
 
 void CCodeGen_Wasm::Emit_Param_Ctx(const STATEMENT& statement)
